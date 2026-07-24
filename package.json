@@ -1,0 +1,22 @@
+{
+  "name": "go-performance",
+  "version": "0.0.1",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json --noEmit && node scripts/build.mjs",
+    "test": "npm run build && tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@adversarylabs/sdk": "^0.1.7",
+    "web-tree-sitter": "^0.26.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "esbuild": "^0.28.1",
+    "tree-sitter-go": "^0.25.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
+

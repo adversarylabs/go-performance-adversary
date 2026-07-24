@@ -1,0 +1,31 @@
+name: go-performance
+version: 0.0.1
+description: Reviews material Go allocation, copying, buffering, retention, and contention risks with evidence.
+
+triggers:
+  manual: true
+  files_changed:
+    - "**/*.go"
+
+detection:
+  files:
+    - "**/*.go"
+
+runtime:
+  name: node
+  version: "22"
+  command:
+    - dist/index.js
+
+permissions:
+  enforcement: advisory
+  filesystem:
+    read:
+      - .
+    write: []
+  network: false
+  environment:
+    allow: []
+
+findings:
+  format: adversary.review.v1

@@ -1,0 +1,1 @@
+{"risk":"medium","findings":[{"ruleId":"go-performance.unbounded-retention","severity":"medium","evidenceCount":1}],"positiveKeys":[],"ship":false}

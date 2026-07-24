@@ -1,0 +1,1 @@
+{"risk":"high","findings":[{"ruleId":"go-performance.compile-in-loop","severity":"high","evidenceCount":1},{"ruleId":"go-performance.unbounded-retention","severity":"medium","evidenceCount":1}],"positiveKeys":[],"ship":false}
