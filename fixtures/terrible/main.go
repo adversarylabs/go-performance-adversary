@@ -1,8 +1,9 @@
 package terrible
 
-import "regexp"
-
-var cache = make(map[string][]byte)
+import (
+	"net/http"
+	"regexp"
+)
 
 func match(pattern string, inputs []string) int {
 	count := 0
@@ -12,4 +13,15 @@ func match(pattern string, inputs []string) int {
 		}
 	}
 	return count
+}
+
+func ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	client := &http.Client{}
+	resp, err := client.Get("https://example.com" + r.URL.Path)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	defer resp.Body.Close()
+	_ = resp
 }

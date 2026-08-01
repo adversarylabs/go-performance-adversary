@@ -1,1 +1,1 @@
-{"risk":"none","findings":[],"positiveKeys":["go-performance-capacity-owned"],"ship":true}
+{"risk":"none","findings":[],"positiveKeys":["go-perf.builder","go-perf.capacity-owned"],"ship":true}

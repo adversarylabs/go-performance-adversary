@@ -1,1 +1,1 @@
-{"risk":"high","findings":[{"ruleId":"go-performance.compile-in-loop","severity":"high","evidenceCount":1},{"ruleId":"go-performance.unbounded-retention","severity":"medium","evidenceCount":1}],"positiveKeys":[],"ship":false}
+{"risk":"high","findings":[{"ruleId":"go-perf.regexp-compile-in-hot-path","severity":"high","evidenceCount":1},{"ruleId":"go-perf.http-client-per-request","severity":"high","evidenceCount":1}],"positiveKeys":[],"ship":false}

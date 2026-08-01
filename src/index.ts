@@ -11,8 +11,8 @@ import { reviewDomain } from "./review.js";
 export function createApp(): Adversary {
   const app = new Adversary({
     name: domain.name,
-    version: "0.0.1",
-    review: { maximumFindings: 5, minimumConfidence: "medium" },
+    version: "0.0.2",
+    review: { maximumFindings: 8, minimumConfidence: "medium" },
   });
 
   app.rule(`${domain.name}.review`, async (ctx) => {

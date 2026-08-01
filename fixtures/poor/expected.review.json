@@ -1,1 +1,1 @@
-{"risk":"medium","findings":[{"ruleId":"go-performance.string-copy","severity":"medium","evidenceCount":1}],"positiveKeys":[],"ship":false}
+{"risk":"high","findings":[{"ruleId":"go-perf.defer-in-loop","severity":"high","evidenceCount":1}],"positiveKeys":[],"ship":false}

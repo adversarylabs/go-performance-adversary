@@ -1,3 +1,9 @@
 package average
 
-var cache = make(map[string][]byte)
+func join(inputs []string) string {
+	out := ""
+	for _, input := range inputs {
+		out += input
+	}
+	return out
+}

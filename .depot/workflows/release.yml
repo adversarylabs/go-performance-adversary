@@ -57,7 +57,8 @@ jobs:
 
       - name: Synchronize release metadata
         id: version
-        uses: adversarylabs/actions/version@0a1079b58cb4aa289df240a12a22afcc5b51ce01
+        # domain/name catalog id support
+        uses: adversarylabs/actions/version@9d990ebe8956cfe876331d21798d53e71c134c66
         with:
           tag: ${{ github.ref_name }}
           path: .
@@ -66,11 +67,13 @@ jobs:
           sync-npm: auto
 
       - name: Push adversary
-        uses: adversarylabs/actions/push@db157870effc0c6c4f254b315514cb7d0fc74a2a
+        # domain/name remote refs
+        uses: adversarylabs/actions/push@9d990ebe8956cfe876331d21798d53e71c134c66
         with:
-          cli-version: 2026.7.20-beta.1
+          # beta.1 rejects permissions.model; pin stable CLI.
+          cli-version: 2026.7.26
           path: .
           token: ${{ secrets.ADVERSARY_SERVICE_ACCOUNT_TOKEN }}
-          registry-namespace: adversarylabs
-          repository-name: ${{ steps.version.outputs.name }}
+          # CI is the publish authority — full catalog path, no adversarylabs/ prefix.
+          remote-reference: registry.adversarylabs.ai/${{ steps.version.outputs.name }}:${{ steps.version.outputs.version }}
           push-latest: true
