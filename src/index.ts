@@ -16,7 +16,7 @@ export function createApp(): Adversary {
   });
 
   app.rule(`${domain.name}.review`, async (ctx) => {
-    const discovery = await discoverSources(ctx.repoPath);
+    const discovery = await discoverSources(ctx);
     const analysis = await analyzeDiscovery(discovery);
     ctx.summary.files_scanned = analysis.filesScanned;
     ctx.review.observe({
@@ -26,7 +26,7 @@ export function createApp(): Adversary {
         : `Prepared ${analysis.filesScanned} ${domain.sourceDescription} files in repository review mode.`,
       metadata: { parser: "tree-sitter-go", mode: analysis.mode, parseErrors: analysis.parseErrors },
     });
-    reviewDomain(ctx, analysis);
+    await reviewDomain(ctx, analysis);
   });
   return app;
 }
