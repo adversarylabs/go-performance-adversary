@@ -1,10 +1,11 @@
 import { type RuleContext } from "@adversarylabs/sdk";
 import { domain } from "./domain.js";
+import { attachImportNavigation } from "./navigation.js";
 import { type Analysis, type RuleDefinition, type Signal } from "./types.js";
 
 const RISK_ORDER = { none: 0, low: 1, medium: 2, high: 3, critical: 4 } as const;
 
-export function reviewDomain(ctx: RuleContext, analysis: Analysis): void {
+export async function reviewDomain(ctx: RuleContext, analysis: Analysis): Promise<void> {
   const active: Array<{ rule: RuleDefinition; signals: Signal[] }> = [];
   for (const rule of domain.rules) {
     const signals = analysis.signals.filter((signal) => signal.ruleId === rule.id);
@@ -33,6 +34,8 @@ export function reviewDomain(ctx: RuleContext, analysis: Analysis): void {
       remediation: { complexity: "small" },
     });
   }
+
+  await attachImportNavigation(ctx, analysis);
 
   addPositives(ctx, analysis);
   if (active.length === 0) {
