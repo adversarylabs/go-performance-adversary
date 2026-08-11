@@ -73,6 +73,17 @@ Public grounding: Go wiki CommonMistakes, gocritic/staticcheck analyzers (`hugeP
 | **Public examples** | gocritic `hugeParam` / `rangeValCopy` analyzers |
 | **Remediation** | Range over indices (`for i := range xs`) or use pointer slices where ownership allows |
 
+### `go-perf.cache-element-footprint-claim`
+
+| | |
+| --- | --- |
+| **What** | A changed cache element gains a descriptor-bearing `string`, slice, or map field while the same changed file claims the default cache stays slim, compact, or unchanged |
+| **Why** | A zero-value descriptor still occupies space in every containing struct value; conditional assignment does not recover the old per-element layout |
+| **Looks for** | All three pieces of changed-file evidence: the new descriptor-bearing field, the struct stored by value in a slice/map, and an explicit cache-footprint claim in a nearby changed comment |
+| **Stays quiet when** | The collection is an ordinary registry/configuration structure; there is no explicit unchanged-footprint claim; metadata lives in opt-in sidecar storage; the element is stored by pointer |
+| **Public examples** | CoreDNS review of optional zonal metadata added to each cached endpoint address |
+| **Remediation** | Keep opt-in metadata in sidecar storage, or measure and accept the per-entry cost and correct the footprint claim |
+
 ### `go-perf.readall-large-source`
 
 | | |
