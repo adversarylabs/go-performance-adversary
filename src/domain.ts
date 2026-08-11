@@ -72,6 +72,20 @@ export const domain: DomainDefinition = {
       impact: "Invisible in review, visible in profiles on hot paths.",
       recommendation: "Range over indices (`for i := range xs`) or use pointer elements where ownership allows.",
     },
+    {
+      id: "go-perf.cache-element-footprint-claim",
+      title: "A cache element grows despite an unchanged-footprint claim",
+      category: "performance",
+      severity: "medium",
+      confidence: "high",
+      summary: (count) =>
+        `${count} cache element field${count === 1 ? "" : "s"} contradict an unchanged-footprint claim.`,
+      whyItMatters:
+        "Zero-value strings, slices, and maps still occupy descriptor space in every containing struct value.",
+      impact: "The default cache footprint grows per entry even when the optional feature is disabled.",
+      recommendation:
+        "Keep opt-in metadata in sidecar storage, or measure and accept the per-entry cost and correct the footprint claim.",
+    },
   ],
   noRiskSummary:
     "No material defer-in-loop, per-request client, repeated compilation, or quadratic string building was found.",

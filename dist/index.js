@@ -17125,6 +17125,17 @@ var domain = {
       whyItMatters: "Copy cost scales with struct size \xD7 iteration count.",
       impact: "Invisible in review, visible in profiles on hot paths.",
       recommendation: "Range over indices (`for i := range xs`) or use pointer elements where ownership allows."
+    },
+    {
+      id: "go-perf.cache-element-footprint-claim",
+      title: "A cache element grows despite an unchanged-footprint claim",
+      category: "performance",
+      severity: "medium",
+      confidence: "high",
+      summary: (count) => `${count} cache element field${count === 1 ? "" : "s"} contradict an unchanged-footprint claim.`,
+      whyItMatters: "Zero-value strings, slices, and maps still occupy descriptor space in every containing struct value.",
+      impact: "The default cache footprint grows per entry even when the optional feature is disabled.",
+      recommendation: "Keep opt-in metadata in sidecar storage, or measure and accept the per-entry cost and correct the footprint claim."
     }
   ],
   noRiskSummary: "No material defer-in-loop, per-request client, repeated compilation, or quadratic string building was found.",
@@ -21394,6 +21405,28 @@ async function parseGo(source) {
   if (tree === null) throw new Error("Tree-sitter returned no syntax tree");
   return tree;
 }
+function walk2(node, visit) {
+  const pending = [node];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (current === void 0) continue;
+    visit(current);
+    for (let index = current.namedChildCount - 1; index >= 0; index -= 1) {
+      const child = current.namedChild(index);
+      if (child !== null) pending.push(child);
+    }
+  }
+}
+function descendants(node, type) {
+  const result = [];
+  walk2(node, (candidate) => {
+    if (candidate.type === type) result.push(candidate);
+  });
+  return result;
+}
+function sourceText(node, source) {
+  return source.slice(node.startIndex, node.endIndex);
+}
 
 // src/analyze.ts
 async function analyzeDiscovery(discovery) {
@@ -21406,6 +21439,7 @@ async function analyzeDiscovery(discovery) {
         const tree = await parseGo(file.current);
         try {
           if (tree.rootNode.hasError) throw new Error("Go source contains syntax errors");
+          signals.push(...cacheElementFootprintSignals(file, tree.rootNode));
         } finally {
           tree.delete();
         }
@@ -21425,6 +21459,91 @@ async function analyzeDiscovery(discovery) {
     positives: positives.sort(byLocation),
     parseErrors: parseErrors.sort((left, right) => left.path.localeCompare(right.path))
   };
+}
+function cacheElementFootprintSignals(file, root) {
+  const claims = cacheFootprintClaims(file, root);
+  if (claims.length === 0) return [];
+  const fields = descendants(root, "field_declaration");
+  const collectionTypes = /* @__PURE__ */ new Map();
+  for (const field of fields) {
+    const type = field.childForFieldName("type");
+    if (type === null) continue;
+    const text = sourceText(type, file.current).replace(/\s+/g, "");
+    const slice = text.match(/^\[\]([A-Za-z_]\w*)$/);
+    const map = text.match(/^map\[[^\]]+\]([A-Za-z_]\w*)$/);
+    const match = slice ?? map;
+    if (match?.[1] !== void 0) collectionTypes.set(match[1], text);
+  }
+  const signals = [];
+  for (const typeSpec of descendants(root, "type_spec")) {
+    const nameNode = typeSpec.childForFieldName("name");
+    const typeNode = typeSpec.childForFieldName("type");
+    if (nameNode === null || typeNode?.type !== "struct_type") continue;
+    const structName = sourceText(nameNode, file.current);
+    const collection = collectionTypes.get(structName);
+    if (collection === void 0) continue;
+    for (const field of descendants(typeNode, "field_declaration")) {
+      const fieldTypeNode = field.childForFieldName("type");
+      const fieldNameNode = field.childForFieldName("name");
+      if (fieldTypeNode === null || fieldNameNode === null) continue;
+      const fieldType = sourceText(fieldTypeNode, file.current).replace(/\s+/g, "");
+      if (!isDescriptorBearing(fieldType)) continue;
+      const line = field.startPosition.row + 1;
+      const endLine = field.endPosition.row + 1;
+      if (!changed(file, line, endLine)) continue;
+      const claim = claims.find((item) => Math.abs(item.line - line) <= 80);
+      if (claim === void 0) continue;
+      const fieldName = sourceText(fieldNameNode, file.current);
+      signals.push({
+        ruleId: "go-perf.cache-element-footprint-claim",
+        path: file.path,
+        line,
+        ...endLine === line ? {} : { endLine },
+        message: `${fieldName} adds a descriptor-bearing ${fieldType} value to ${structName}, which is stored as ${collection}, while the changed source claims the cache footprint stays slim or unchanged.`,
+        snippet: sourceText(field, file.current).trim().slice(0, 300),
+        data: {
+          struct: structName,
+          field: fieldName,
+          fieldType,
+          collection,
+          claimLine: claim.line,
+          claim: claim.text.slice(0, 300)
+        }
+      });
+    }
+  }
+  return signals;
+}
+function cacheFootprintClaims(file, root) {
+  const comments = descendants(root, "comment").sort(
+    (left, right) => left.startPosition.row - right.startPosition.row
+  );
+  const groups = [];
+  for (const comment of comments) {
+    const current = groups[groups.length - 1];
+    const previous = current?.[current.length - 1];
+    if (current !== void 0 && previous !== void 0 && comment.startPosition.row <= previous.endPosition.row + 1) {
+      current.push(comment);
+    } else {
+      groups.push([comment]);
+    }
+  }
+  const claims = [];
+  for (const group of groups) {
+    const startLine = group[0].startPosition.row + 1;
+    const endLine = group[group.length - 1].endPosition.row + 1;
+    if (!changed(file, startLine, endLine)) continue;
+    const text = group.map((node) => sourceText(node, file.current)).join(" ").replace(/\/\/|\/\*|\*\//g, " ").replace(/\s+/g, " ").trim();
+    if (!/\bcach(?:e|ed|ing)\b/i.test(text)) continue;
+    if (!/\b(?:unchanged|same|slim|compact|size[- ]neutral)\b|\bno\s+(?:additional|extra)\b/i.test(text)) {
+      continue;
+    }
+    claims.push({ line: startLine, text });
+  }
+  return claims;
+}
+function isDescriptorBearing(type) {
+  return type === "string" || type.startsWith("[]") || type.startsWith("map[");
 }
 function changed(file, line, endLine = line) {
   if (file.status === "repository" || file.status === "added") return true;
