@@ -1,5 +1,5 @@
 name: go/performance
-version: 0.0.5
+version: 0.0.6
 description: "Reviews Go for defer-in-loop, per-request clients, hot-path regexp compilation, and quadratic string building."
 
 triggers:
