@@ -21557,8 +21557,11 @@ function byLocation(left, right) {
 }
 
 // src/discover.ts
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 var MAX_FILE_BYTES = 75e4;
 var MAX_FILES = 750;
+var execute = promisify(execFile);
 async function discoverSources(ctx) {
   const sources = await ctx.loadInScopeSources({
     include: domain.includePath,
@@ -21566,18 +21569,68 @@ async function discoverSources(ctx) {
     maxBytes: MAX_FILE_BYTES
   });
   const wholeTarget = ctx.change === null || ctx.change.scanMode === "all";
-  const files = sources.map((source) => ({
-    path: source.path,
-    current: source.content,
-    // Full-file eligibility: platform already scoped the change; do not re-diff.
-    changedLines: /* @__PURE__ */ new Set(),
-    status: source.status === "repository" ? "repository" : "added"
-  }));
+  const files = [];
+  for (const source of sources) {
+    if (source.status === "repository") {
+      files.push({
+        path: source.path,
+        current: source.content,
+        changedLines: /* @__PURE__ */ new Set(),
+        status: "repository"
+      });
+      continue;
+    }
+    const change = await changedSource(ctx, source.path);
+    files.push({
+      path: source.path,
+      current: source.content,
+      changedLines: change.changedLines,
+      status: change.status
+    });
+  }
   return {
     mode: wholeTarget ? "repository" : "diff",
     ...ctx.change?.baseRef === void 0 ? {} : { base: ctx.change.baseRef },
     files
   };
+}
+async function changedSource(ctx, path) {
+  const base = ctx.change?.baseRef;
+  if (base === void 0 || !await existsAtRevision(ctx.repoPath, base, path)) {
+    return { changedLines: /* @__PURE__ */ new Set(), status: "added" };
+  }
+  const args2 = ["diff", "--unified=0", base];
+  const head = ctx.change?.headRef;
+  if (head !== void 0 && !ctx.change?.worktree) args2.push(head);
+  args2.push("--", path);
+  const patch = await gitOutput(ctx.repoPath, args2);
+  return { changedLines: changedLineNumbers(patch), status: "modified" };
+}
+async function existsAtRevision(repoPath, revision, path) {
+  try {
+    await execute("git", ["-C", repoPath, "cat-file", "-e", `${revision}:${path}`], {
+      maxBuffer: 1024 * 1024
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function gitOutput(repoPath, args2) {
+  const result = await execute("git", ["-C", repoPath, ...args2], {
+    encoding: "utf8",
+    maxBuffer: 8 * 1024 * 1024
+  });
+  return result.stdout;
+}
+function changedLineNumbers(patch) {
+  const lines = /* @__PURE__ */ new Set();
+  for (const match of patch.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm)) {
+    const start2 = Number(match[1]);
+    const count = match[2] === void 0 ? 1 : Number(match[2]);
+    for (let line = start2; line < start2 + count; line += 1) lines.add(line);
+  }
+  return lines;
 }
 
 // src/navigation.ts
