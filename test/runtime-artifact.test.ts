@@ -19,6 +19,7 @@ test("the published runtime executes without node_modules", async () => {
 
   await mkdir(dirname(entrypoint), { recursive: true });
   await mkdir(join(artifact, "schemas"), { recursive: true });
+  await mkdir(join(artifact, "licenses"), { recursive: true });
   await copyFile(join(projectRoot, "dist", "index.js"), entrypoint);
   await copyFile(join(projectRoot, "dist", "web-tree-sitter.wasm"), join(artifact, "dist", "web-tree-sitter.wasm"));
   await copyFile(join(projectRoot, "dist", "tree-sitter-go.wasm"), join(artifact, "dist", "tree-sitter-go.wasm"));
@@ -26,12 +27,27 @@ test("the published runtime executes without node_modules", async () => {
     join(projectRoot, "schemas", "adversary.review.v1.schema.json"),
     join(artifact, "schemas", "adversary.review.v1.schema.json"),
   );
+  for (const name of [
+    "adversarylabs-sdk",
+    "ajv",
+    "fast-deep-equal",
+    "fast-uri",
+    "json-schema-traverse",
+    "tree-sitter-go",
+    "web-tree-sitter",
+    "yaml",
+  ]) {
+    const license = join(projectRoot, "licenses", `${name}.txt`);
+    assert.match(await readFile(license, "utf8"), /copyright|license/i);
+    await copyFile(license, join(artifact, "licenses", `${name}.txt`));
+  }
   await writeFile(join(artifact, "package.json"), '{"type":"module"}\n');
   await writeFile(join(repository, "main.go"), "package sample\n\nfunc ready() bool { return true }\n");
   await writeFile(input, `${JSON.stringify({ source: { path: repository } })}\n`);
 
   const bundle = await readFile(entrypoint, "utf8");
   assert.doesNotMatch(bundle, /from\s+["'](?:@adversarylabs\/sdk|web-tree-sitter)["']/);
+  assert.doesNotMatch(bundle, /\/Users\/|\/private\/tmp\//);
 
   await execute(process.execPath, [entrypoint], {
     cwd: artifact,

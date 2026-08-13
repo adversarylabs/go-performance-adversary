@@ -8,7 +8,7 @@ Source of truth for what this adversary is *for*.
 
 ## Mission
 
-Review Go for hot-path performance defects (defer-in-loop, per-request clients, regexp compile, quadratic strings).
+Review Go for hot-path performance defects and resource amplification (defer-in-loop, per-request clients, regexp compile, quadratic strings, and expensive shared caches keyed by request-controlled values).
 
 ## In scope (fair miss if humans raised it and we did not)
 
@@ -16,6 +16,9 @@ Review Go for hot-path performance defects (defer-in-loop, per-request clients, 
 - Per-request HTTP clients / connection thrash
 - Hot-path regexp compilation
 - Quadratic string building
+- Request-controlled cookie/header/query/path keys that can multiply expensive cache misses and retained entries without a hard cardinality bound
+
+For request-keyed caches, a TTL alone is not a cardinality bound. Structurally proven fixed key allowlists, request-local maps, and explicit entry/weight-limited eviction are not misses. A method name such as `Allow`, `Admit`, or `Take` is not treated as admission proof without verifiable bounded behavior.
 
 ## Out of scope (not a miss for this adversary)
 

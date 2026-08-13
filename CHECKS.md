@@ -2,11 +2,11 @@
 
 This file is the **public audit list** of detectors for the **go-performance** adversary. High-confidence performance defects in Go with file:line evidence — not a micro-optimization linter. Performance advice is the easiest place to lose trust with contextless nitpicks, so this catalog is deliberately small and biased toward patterns that cause production incidents (resource exhaustion, connection-pool loss, O(n²) blowups), not nanosecond wins.
 
-Runtime source of truth: [`src/spec.ts`](src/spec.ts) / [`src/rules.ts`](src/rules.ts).
+Runtime source of truth: [`src/domain.ts`](src/domain.ts) / [`src/analyze.ts`](src/analyze.ts).
 
 **Scope:** `*.go` excluding vendored trees and `_test.go` (benchmark code intentionally does odd things).
 
-**Precision stance:** No preallocation nits, no `fmt.Sprintf`-vs-concat micro advice, no "use sync.Pool" suggestions. Fire on patterns that are wrong at any scale (defer-in-loop resource pileups, per-request clients) or wrong at data scale (quadratic string building). When impact depends on loop bounds, gate on unbounded/large iteration sources or defer to LLM judgment.
+**Precision stance:** No preallocation nits, no `fmt.Sprintf`-vs-concat micro advice, no "use sync.Pool" suggestions. Fire on patterns that are wrong at any scale (defer-in-loop resource pileups, per-request clients), wrong at data scale (quadratic string building), or that let request-controlled cardinality amplify expensive work and retained cache state.
 
 Public grounding: Go wiki CommonMistakes, gocritic/staticcheck analyzers (`hugeParam`, `rangeValCopy`), and net/http connection-pooling documentation.
 
@@ -83,6 +83,17 @@ Public grounding: Go wiki CommonMistakes, gocritic/staticcheck analyzers (`hugeP
 | **Stays quiet when** | The collection is an ordinary registry/configuration structure; there is no explicit unchanged-footprint claim; metadata lives in opt-in sidecar storage; the element is stored by pointer |
 | **Public examples** | CoreDNS review of optional zonal metadata added to each cached endpoint address |
 | **Remediation** | Keep opt-in metadata in sidecar storage, or measure and accept the per-entry cost and correct the footprint claim |
+
+### `go-perf.request-keyed-cache-amplification`
+
+| | |
+| --- | --- |
+| **What** | A cookie, header, query, or path value (or a direct deterministic derivation) keys a package- or receiver-owned cache whose miss path performs remote, file, or database work before inserting a new entry |
+| **Why** | A caller can manufacture distinct keys to multiply backend work and retained memory. A TTL limits entry age, but does not bound how many keys can be admitted during the TTL window |
+| **Looks for** | Structural cross-file evidence joining an actual `net/http.Request` source, key propagation, lookup/miss path, key-dependent material work, and map insertion. A full cache scan under a shared lock strengthens the evidence but is not required |
+| **Stays quiet when** | The map is request-local; the value is not request controlled; no material miss work is proven; keys come from a structurally proven fixed allowlist; or the cache has a hard entry/weight limit with rejection or eviction (including an explicit bounded LRU). A method named `Allow`, `Admit`, or `Take` is not proof of bounded admission by itself. |
+| **Public examples** | Grafana preview-assets cache: forged `grafana_preview_assets` cookie values caused distinct bucket fetches and package-cache entries; fixed with a 64-entry expiring LRU |
+| **Remediation** | Put a hard entry/weight bound and eviction on the cache, or constrain/admit request keys before performing the miss work |
 
 ### `go-perf.readall-large-source`
 

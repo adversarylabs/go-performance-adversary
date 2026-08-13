@@ -3647,7 +3647,12 @@ var require_fast_uri = __commonJS({
     }
     function resolve3(baseURI, relativeURI, options) {
       const schemelessOptions = options ? Object.assign({ scheme: "null" }, options) : { scheme: "null" };
-      const resolved = resolveComponent(parse(baseURI, schemelessOptions), parse(relativeURI, schemelessOptions), schemelessOptions, true);
+      const { parsed: baseParsed, malformedAuthorityOrPort: baseMalformed } = parseWithStatus(baseURI, schemelessOptions);
+      const { parsed: relativeParsed, malformedAuthorityOrPort: relativeMalformed } = parseWithStatus(relativeURI, schemelessOptions);
+      if (baseMalformed || relativeMalformed) {
+        throw new Error(baseParsed.error || relativeParsed.error || "URI is malformed.");
+      }
+      const resolved = resolveComponent(baseParsed, relativeParsed, schemelessOptions, true);
       schemelessOptions.skipEscape = true;
       return serialize(resolved, schemelessOptions);
     }
@@ -3773,6 +3778,7 @@ var require_fast_uri = __commonJS({
     }
     var URI_PARSE = /^(?:([^#/:?]+):)?(?:\/\/((?:([^#/?@]*)@)?(\[[^#/?\]]+\]|[^#/:?]*)(?::(\d*))?))?([^#?]*)(?:\?([^#]*))?(?:#((?:.|[\n\r])*))?/u;
     var AUTHORITY_PREFIX = /^(?:[^#/:?]+:)?\/\/([^/?#]*)/;
+    var AUTHORITY_INTRODUCER_REGION = /^(?:[^#/:?]+:)?([/\\\t\n\r]*)/;
     function getParseError(parsed, matches) {
       if (matches[2] !== void 0 && parsed.path && parsed.path[0] !== "/") {
         return 'URI path must start with "/" when authority is present.';
@@ -3806,6 +3812,20 @@ var require_fast_uri = __commonJS({
       if (authorityMatch !== null && authorityMatch[1].indexOf("\\") !== -1) {
         parsed.error = "URI authority must not contain a literal backslash.";
         malformedAuthorityOrPort = true;
+      }
+      const introducerMatch = uri.match(AUTHORITY_INTRODUCER_REGION);
+      if (introducerMatch !== null) {
+        const region = introducerMatch[1];
+        const normalizedRegion = region.replace(/[\t\n\r]/g, "");
+        if (normalizedRegion.length >= 2) {
+          if (normalizedRegion.slice(0, 2) !== "//") {
+            parsed.error = parsed.error || "URI authority must not contain a literal backslash.";
+            malformedAuthorityOrPort = true;
+          } else if (region.length !== normalizedRegion.length) {
+            parsed.error = parsed.error || "URI authority introducer must not contain whitespace.";
+            malformedAuthorityOrPort = true;
+          }
+        }
       }
       const matches = uri.match(URI_PARSE);
       if (matches) {
@@ -17136,6 +17156,17 @@ var domain = {
       whyItMatters: "Zero-value strings, slices, and maps still occupy descriptor space in every containing struct value.",
       impact: "The default cache footprint grows per entry even when the optional feature is disabled.",
       recommendation: "Keep opt-in metadata in sidecar storage, or measure and accept the per-entry cost and correct the footprint claim."
+    },
+    {
+      id: "go-perf.request-keyed-cache-amplification",
+      title: "Request-controlled keys can grow an expensive shared cache without bound",
+      category: "performance",
+      severity: "medium",
+      confidence: "medium",
+      summary: (count) => `${count} request-keyed cache path${count === 1 ? "" : "s"} can amplify misses and retained entries without a cardinality bound.`,
+      whyItMatters: "An attacker can vary a cookie, header, query, or path value to force distinct cache misses, material backend work, and long-lived entries; a TTL limits age, not the number admitted during that window.",
+      impact: "Request volume is amplified into remote/file/database work and memory growth across the process.",
+      recommendation: "Use a cache with a hard entry/weight limit and eviction, or constrain/admit request keys before doing the miss work."
     }
   ],
   noRiskSummary: "No material defer-in-loop, per-request client, repeated compilation, or quadratic string building was found.",
@@ -17176,18 +17207,18 @@ function deferInLoopSignals(file) {
   const signals = [];
   const lines = file.current.split("\n");
   let loopDepth = 0;
-  let braceDepth = 0;
+  let braceDepth2 = 0;
   const loopBraceAt = [];
   for (let i2 = 0; i2 < lines.length; i2 += 1) {
     const line = lines[i2] ?? "";
     const trimmed = line.trim();
     if (/^\s*for\b/.test(line) && !trimmed.startsWith("//")) {
       loopDepth += 1;
-      loopBraceAt.push(braceDepth);
+      loopBraceAt.push(braceDepth2);
     }
     const opens = (line.match(/\{/g) ?? []).length;
     const closes = (line.match(/\}/g) ?? []).length;
-    braceDepth += opens - closes;
+    braceDepth2 += opens - closes;
     if (loopDepth > 0 && /\bdefer\s+/.test(line) && !trimmed.startsWith("//")) {
       signals.push({
         ruleId: "go-perf.defer-in-loop",
@@ -17198,9 +17229,9 @@ function deferInLoopSignals(file) {
         data: {}
       });
     }
-    while (loopDepth > 0 && braceDepth <= (loopBraceAt[loopBraceAt.length - 1] ?? 0) && closes > 0) {
+    while (loopDepth > 0 && braceDepth2 <= (loopBraceAt[loopBraceAt.length - 1] ?? 0) && closes > 0) {
       const startDepth = loopBraceAt[loopBraceAt.length - 1] ?? 0;
-      if (braceDepth <= startDepth) {
+      if (braceDepth2 <= startDepth) {
         loopDepth -= 1;
         loopBraceAt.pop();
       } else {
@@ -17215,7 +17246,7 @@ function httpClientPerRequestSignals(file) {
   const lines = file.current.split("\n");
   let inHotFunc = false;
   let hotBraceBase = 0;
-  let braceDepth = 0;
+  let braceDepth2 = 0;
   let loopDepth = 0;
   const loopBraceAt = [];
   for (let i2 = 0; i2 < lines.length; i2 += 1) {
@@ -17223,18 +17254,18 @@ function httpClientPerRequestSignals(file) {
     const funcMatch = line.match(
       /^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)?\s*\([^)]*\)/
     );
-    if (funcMatch && braceDepth === 0) {
+    if (funcMatch && braceDepth2 === 0) {
       const name2 = funcMatch[1] ?? "";
       inHotFunc = /^(?:ServeHTTP|Handle|Handler|handle|serve|Serve)$/.test(name2) || /Handler$/.test(name2);
       hotBraceBase = 0;
     }
     if (/^\s*for\b/.test(line)) {
       loopDepth += 1;
-      loopBraceAt.push(braceDepth);
+      loopBraceAt.push(braceDepth2);
     }
     const opens = (line.match(/\{/g) ?? []).length;
     const closes = (line.match(/\}/g) ?? []).length;
-    braceDepth += opens - closes;
+    braceDepth2 += opens - closes;
     if ((inHotFunc || loopDepth > 0) && /(?:\&)?http\.(?:Client|Transport)\s*\{/.test(line)) {
       signals.push({
         ruleId: "go-perf.http-client-per-request",
@@ -17245,14 +17276,14 @@ function httpClientPerRequestSignals(file) {
         data: {}
       });
     }
-    while (loopDepth > 0 && braceDepth <= (loopBraceAt[loopBraceAt.length - 1] ?? 0) && closes > 0) {
+    while (loopDepth > 0 && braceDepth2 <= (loopBraceAt[loopBraceAt.length - 1] ?? 0) && closes > 0) {
       const startDepth = loopBraceAt[loopBraceAt.length - 1] ?? 0;
-      if (braceDepth <= startDepth) {
+      if (braceDepth2 <= startDepth) {
         loopDepth -= 1;
         loopBraceAt.pop();
       } else break;
     }
-    if (inHotFunc && braceDepth <= hotBraceBase && closes > 0 && braceDepth === 0) {
+    if (inHotFunc && braceDepth2 <= hotBraceBase && closes > 0 && braceDepth2 === 0) {
       inHotFunc = false;
     }
   }
@@ -17280,17 +17311,17 @@ function regexpHotPathSignals(file) {
   );
   const lines = file.current.split("\n");
   let inHandler = false;
-  let braceDepth = 0;
+  let braceDepth2 = 0;
   for (let i2 = 0; i2 < lines.length; i2 += 1) {
     const line = lines[i2] ?? "";
     const funcMatch = line.match(/^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)?\s*\(/);
-    if (funcMatch && braceDepth === 0) {
+    if (funcMatch && braceDepth2 === 0) {
       const name2 = funcMatch[1] ?? "";
       inHandler = /^(?:ServeHTTP|Handle)$/.test(name2) || /Handler$/.test(name2);
     }
     const opens = (line.match(/\{/g) ?? []).length;
     const closes = (line.match(/\}/g) ?? []).length;
-    braceDepth += opens - closes;
+    braceDepth2 += opens - closes;
     if (inHandler && /regexp\.(?:Compile|MustCompile)\s*\(/.test(line)) {
       if (/regexp\.(?:Compile|MustCompile)\s*\(\s*["`]/.test(line) || true) {
         signals.push({
@@ -17303,7 +17334,7 @@ function regexpHotPathSignals(file) {
         });
       }
     }
-    if (inHandler && braceDepth === 0 && closes > 0) inHandler = false;
+    if (inHandler && braceDepth2 === 0 && closes > 0) inHandler = false;
   }
   const seen = /* @__PURE__ */ new Set();
   return signals.filter((s) => {
@@ -17317,17 +17348,17 @@ function stringConcatLoopSignals(file) {
   const signals = [];
   const lines = file.current.split("\n");
   let loopDepth = 0;
-  let braceDepth = 0;
+  let braceDepth2 = 0;
   const loopBraceAt = [];
   for (let i2 = 0; i2 < lines.length; i2 += 1) {
     const line = lines[i2] ?? "";
     if (/^\s*for\b/.test(line)) {
       loopDepth += 1;
-      loopBraceAt.push(braceDepth);
+      loopBraceAt.push(braceDepth2);
     }
     const opens = (line.match(/\{/g) ?? []).length;
     const closes = (line.match(/\}/g) ?? []).length;
-    braceDepth += opens - closes;
+    braceDepth2 += opens - closes;
     if (loopDepth > 0 && !/^\s*\/\//.test(line) && !/\b(?:append|make)\b/.test(line)) {
       const stringyAccum = /\b(?:out|s|str|text|msg|buf|body|joined|result|acc|builder)\s*(?:\+=|=\s*\w+\s*\+)/.test(
         line
@@ -17344,9 +17375,9 @@ function stringConcatLoopSignals(file) {
         });
       }
     }
-    while (loopDepth > 0 && braceDepth <= (loopBraceAt[loopBraceAt.length - 1] ?? 0) && closes > 0) {
+    while (loopDepth > 0 && braceDepth2 <= (loopBraceAt[loopBraceAt.length - 1] ?? 0) && closes > 0) {
       const startDepth = loopBraceAt[loopBraceAt.length - 1] ?? 0;
-      if (braceDepth <= startDepth) {
+      if (braceDepth2 <= startDepth) {
         loopDepth -= 1;
         loopBraceAt.pop();
       } else break;
@@ -21428,6 +21459,1544 @@ function sourceText(node, source) {
   return source.slice(node.startIndex, node.endIndex);
 }
 
+// src/request-cache.ts
+var RULE_ID = "go-perf.request-keyed-cache-amplification";
+async function requestKeyedCacheSignals(files) {
+  const previousFiles = files.flatMap((file) => {
+    if (file.status === "added") return [];
+    const { previous, ...revision } = file;
+    if (file.status === "modified") {
+      if (previous === void 0) return [];
+      return [{ ...revision, current: previous, status: "repository", changedLines: /* @__PURE__ */ new Set() }];
+    }
+    return [{ ...revision, status: "repository", changedLines: /* @__PURE__ */ new Set() }];
+  });
+  const previousFingerprints = files.some((file) => file.status === "modified" && file.previous !== void 0) ? new Set((await currentRequestKeyedCacheSignals(previousFiles)).map((signal) => signal.data.semanticFingerprint)) : /* @__PURE__ */ new Set();
+  return (await currentRequestKeyedCacheSignals(files)).filter((signal) => !previousFingerprints.has(signal.data.semanticFingerprint));
+}
+async function currentRequestKeyedCacheSignals(files) {
+  const program = await collectProgramFacts(files.filter((file) => file.path.endsWith(".go")));
+  if (program.caches.size === 0 || program.functions.length === 0) return [];
+  const byName = uniqueFunctionsByName(program.functions);
+  const returnDependencies = calculateReturnDependencies(program.functions, byName);
+  const parameterSeeds = calculateRequestParameterSeeds(program.functions, byName, returnDependencies);
+  const callEdges = requestCallEdges(program.functions, byName, returnDependencies, parameterSeeds);
+  const lookupSummaries = cacheLookupSummaries(program.functions, byName, returnDependencies, program.caches);
+  const signals = [];
+  for (const fn of program.functions) {
+    const seeds = parameterSeeds.get(fn.id) ?? /* @__PURE__ */ new Map();
+    for (const insertion of fn.accesses.filter((access) => access.kind === "insert")) {
+      const insertionCacheId = resolveCacheAt(fn, insertion.cacheText, insertion.start, insertion.scopeId, program.caches);
+      if (insertionCacheId === void 0) continue;
+      insertion.cacheId = insertionCacheId;
+      const cache = program.caches.get(insertionCacheId);
+      if (cache === void 0) continue;
+      const insertionEnvironment = environmentAt(fn, insertion.start, insertion.scopeId, seeds, byName, returnDependencies);
+      const keyDependencies = expressionDependencies(insertion.key, insertionEnvironment, byName, returnDependencies);
+      if (requestOrigins(keyDependencies).size === 0) continue;
+      const lookup = findCacheLookup(
+        fn,
+        insertion,
+        keyDependencies,
+        seeds,
+        lookupSummaries,
+        byName,
+        returnDependencies,
+        program.caches
+      );
+      if (lookup === void 0) continue;
+      const material = findMaterialWork(fn, insertion, lookup, keyDependencies, seeds, byName, returnDependencies);
+      if (material === void 0) continue;
+      const requestPath = requestPathTo(fn, callEdges);
+      const localAdmission = hasFiniteAdmission([{
+        fn,
+        beforePosition: material.start,
+        seeds
+      }], keyDependencies, byName, returnDependencies);
+      const incoming = requestPath.filter((edge) => edge.callee.id === fn.id);
+      const allIncomingAdmitted = incoming.length > 0 && incoming.every((edge) => {
+        const callerSeeds = parameterSeeds.get(edge.caller.id) ?? /* @__PURE__ */ new Map();
+        const callerEnvironment = environmentAt(
+          edge.caller,
+          edge.start,
+          edge.scopeId,
+          callerSeeds,
+          byName,
+          returnDependencies
+        );
+        const mappedKey = mapParameterDependencies(keyDependencies, edge.call, callerEnvironment, byName, returnDependencies);
+        return hasFiniteAdmission([{
+          fn: edge.caller,
+          beforePosition: edge.start,
+          seeds: callerSeeds
+        }], mappedKey, byName, returnDependencies);
+      });
+      if (localAdmission || allIncomingAdmitted) {
+        continue;
+      }
+      if (hasHardCacheBound(
+        fn,
+        insertion,
+        material,
+        program.finiteConstants,
+        program.shadowedBuiltins,
+        program.caches,
+        program.functions
+      )) continue;
+      const anchors = [
+        { path: cache.path, line: cache.line, endLine: cache.endLine, role: "persistent cache declaration" },
+        ...requestPath.map((edge) => ({
+          path: edge.caller.path,
+          line: edge.line,
+          endLine: edge.endLine,
+          role: "request-key propagation"
+        })),
+        ...[fn, ...requestPath.map((edge) => edge.caller)].flatMap((item) => item.requestSources.filter((source) => keyDependencies.has(source.origin)).map((source) => ({
+          path: item.path,
+          line: source.line,
+          endLine: source.endLine,
+          role: "request-key source"
+        }))),
+        { path: fn.path, line: lookup.line, endLine: lookup.endLine, role: "cache lookup" },
+        { path: fn.path, line: material.line, endLine: material.endLine, role: "material miss work" },
+        { path: fn.path, line: insertion.line, endLine: insertion.endLine, role: "cache insertion" }
+      ];
+      const anchor = anchors.map((candidate) => ({
+        ...candidate,
+        changedLine: changedLineInRange(files, candidate.path, candidate.line, candidate.endLine)
+      })).find((candidate) => candidate.changedLine !== void 0);
+      if (anchor === void 0) continue;
+      const changedLine = anchor.changedLine;
+      const anchorFile = files.find((candidate) => candidate.path === anchor.path);
+      const scanUnderLock = hasSharedLinearScan(program.functions, insertion.cacheId);
+      const semanticFingerprint = [
+        cache.id,
+        `${fn.path}:${fn.name}`,
+        semanticCode(cache.text),
+        semanticCode(lookup.text),
+        semanticCode(material.text),
+        semanticCode(insertion.text),
+        [...keyDependencies].sort().join(","),
+        ...requestPath.map((edge) => `${edge.caller.path}:${edge.caller.name}:${semanticCode(edge.call.text)}`)
+      ].join("|");
+      signals.push({
+        ruleId: RULE_ID,
+        path: anchor.path,
+        line: changedLine,
+        message: `A request-controlled key reaches ${insertion.cacheText}, whose miss path performs ${material.name} before inserting into a long-lived cache without a proven entry/weight bound or eviction.` + (scanUnderLock ? " The same cache is also scanned under a lock, multiplying per-request work as it grows." : ""),
+        snippet: lineAt(anchorFile?.current ?? "", changedLine).trim().slice(0, 300),
+        data: {
+          anchor: anchor.role,
+          cache: insertion.cacheText,
+          cacheDeclaration: `${cache.path}:${cache.line}`,
+          lookup: `${fn.path}:${lookup.line}`,
+          materialWork: `${fn.path}:${material.line}`,
+          insertion: `${fn.path}:${insertion.line}`,
+          requestPath: requestPath.map((edge) => `${edge.caller.path}:${edge.line} -> ${edge.callee.name}`),
+          ttlIsNotCardinalityBound: true,
+          sharedLinearScanUnderLock: scanUnderLock,
+          semanticFingerprint
+        }
+      });
+    }
+  }
+  return deduplicate(signals);
+}
+function semanticCode(source) {
+  return maskGoNonCode(source, false).replace(/\s+/g, "");
+}
+async function collectProgramFacts(files) {
+  const functions = [];
+  const caches = /* @__PURE__ */ new Map();
+  const finiteConstants = /* @__PURE__ */ new Set();
+  const shadowedBuiltins = /* @__PURE__ */ new Set();
+  const receiverMapFields = /* @__PURE__ */ new Map();
+  for (const file of files) {
+    const tree = await parseGo(file.current);
+    try {
+      if (tree.rootNode.hasError) continue;
+      const scope = packageScope(file.path);
+      for (const declaration of descendants(tree.rootNode, "function_declaration")) {
+        if (declaration.parent?.type !== "source_file") continue;
+        const name2 = declaration.childForFieldName("name");
+        if (name2 !== null && sourceText(name2, file.current) === "len") shadowedBuiltins.add(`${scope}:len`);
+      }
+      for (const declaration of descendants(tree.rootNode, "var_spec").concat(descendants(tree.rootNode, "const_spec")).concat(descendants(tree.rootNode, "type_spec"))) {
+        if (declaration.parent?.parent?.type !== "source_file" && declaration.parent?.type !== "source_file") continue;
+        if (declaredNames(declaration, file.current).includes("len")) shadowedBuiltins.add(`${scope}:len`);
+      }
+      collectFiniteConstants(file, tree.rootNode, finiteConstants, scope);
+      collectPersistentCaches(file, tree.rootNode, caches, receiverMapFields, scope);
+      const aliases = importAliases(file.current, tree.rootNode, "net/http", "http");
+      const sqlAliases = importAliases(file.current, tree.rootNode, "database/sql", "sql");
+      const fileAliases = /* @__PURE__ */ new Set([
+        ...importAliases(file.current, tree.rootNode, "os", "os"),
+        ...importAliases(file.current, tree.rootNode, "io/fs", "fs")
+      ]);
+      for (const node of [
+        ...descendants(tree.rootNode, "function_declaration"),
+        ...descendants(tree.rootNode, "method_declaration")
+      ]) {
+        const fact = functionFact(file, node, caches, receiverMapFields, aliases, sqlAliases, fileAliases, scope);
+        if (fact !== void 0) functions.push(fact);
+      }
+    } finally {
+      tree.delete();
+    }
+  }
+  return { functions, caches, finiteConstants, shadowedBuiltins };
+}
+function collectPersistentCaches(file, root, caches, receiverMapFields, scope) {
+  for (const declaration of descendants(root, "var_declaration")) {
+    if (declaration.parent?.type !== "source_file") continue;
+    for (const spec of descendants(declaration, "var_spec")) {
+      const text = sourceText(spec, file.current);
+      if (!/\bmap\s*\[/.test(text)) continue;
+      const name2 = text.match(/^\s*([A-Za-z_]\w*)/)?.[1];
+      if (name2 === void 0) continue;
+      caches.set(`global:${scope}:${name2}`, {
+        id: `global:${scope}:${name2}`,
+        path: file.path,
+        line: spec.startPosition.row + 1,
+        endLine: spec.endPosition.row + 1,
+        text: text.trim()
+      });
+    }
+  }
+  for (const typeSpec of descendants(root, "type_spec")) {
+    const typeNameNode = typeSpec.childForFieldName("name");
+    const type = typeSpec.childForFieldName("type");
+    if (typeNameNode === null || type?.type !== "struct_type") continue;
+    const typeName = sourceText(typeNameNode, file.current);
+    for (const field of descendants(type, "field_declaration")) {
+      const fieldType = field.childForFieldName("type");
+      if (fieldType === null || !/^map\s*\[/.test(sourceText(fieldType, file.current).trim())) continue;
+      const name2 = field.childForFieldName("name");
+      if (name2 === null) continue;
+      const fieldName = sourceText(name2, file.current);
+      const receiverType = `${scope}:${typeName}`;
+      const fields = receiverMapFields.get(receiverType) ?? /* @__PURE__ */ new Set();
+      fields.add(fieldName);
+      receiverMapFields.set(receiverType, fields);
+      caches.set(`field:${receiverType}.${fieldName}`, {
+        id: `field:${receiverType}.${fieldName}`,
+        path: file.path,
+        line: field.startPosition.row + 1,
+        endLine: field.endPosition.row + 1,
+        text: sourceText(field, file.current).trim()
+      });
+    }
+  }
+}
+function functionFact(file, node, caches, receiverMapFields, httpAliases, sqlAliases, fileAliases, scope) {
+  const nameNode = node.childForFieldName("name");
+  const parametersNode = node.childForFieldName("parameters");
+  const body2 = node.childForFieldName("body");
+  if (nameNode === null || parametersNode === null || body2 === null) return void 0;
+  const name2 = sourceText(nameNode, file.current);
+  const params = parameters(parametersNode, file.current, httpAliases, sqlAliases);
+  const scopes = lexicalScopes(body2, file.current, params, httpAliases, sqlAliases);
+  const rootScopeId = scopeForNode(body2, scopes).id;
+  const assignments = descendants(body2, "short_var_declaration").concat(descendants(body2, "assignment_statement")).sort((left, right) => left.startIndex - right.startIndex).map((assignment) => assignmentFact(file.current, assignment, scopeForNode(assignment, scopes).id)).filter((item) => item !== void 0).concat(descendants(body2, "var_spec").sort((left, right) => left.startIndex - right.startIndex).map((spec) => variableFact(file.current, spec, scopeForNode(spec, scopes).id)).filter((item) => item !== void 0)).sort((left, right) => left.start - right.start);
+  const calls = descendants(body2, "call_expression").sort((left, right) => left.startIndex - right.startIndex).map((call) => callFact(file.current, call, scopeForNode(call, scopes).id)).filter((item) => item !== void 0 && item.executable);
+  const returns = descendants(body2, "return_statement").map((item) => {
+    const text = sourceText(item, file.current).replace(/^\s*return\b/, "").trim();
+    return {
+      expressions: splitTopLevel(text),
+      start: item.startIndex,
+      scopeId: scopeForNode(item, scopes).id
+    };
+  });
+  const receiverCaches = /* @__PURE__ */ new Map();
+  const receiver = node.childForFieldName("receiver");
+  if (receiver !== null) {
+    const declaration = descendants(receiver, "parameter_declaration")[0];
+    const receiverName = declaration?.childForFieldName("name");
+    const receiverType = declaration?.childForFieldName("type");
+    if (receiverName !== null && receiverName !== void 0 && receiverType !== null && receiverType !== void 0) {
+      const variable = sourceText(receiverName, file.current);
+      const typeName = sourceText(receiverType, file.current).replace(/^\*/, "");
+      const receiverId = `${scope}:${typeName}`;
+      for (const field of receiverMapFields.get(receiverId) ?? []) {
+        receiverCaches.set(`${variable}.${field}`, `field:${receiverId}.${field}`);
+      }
+    }
+  }
+  const accesses = cacheAccesses(file.current, body2, scopes);
+  const admissions = fixedAdmissions(file.current, body2, scopes);
+  const capacityGuards = capacityGuardFacts(file.current, body2, scopes);
+  const requestSources = calls.filter((call) => {
+    const receiver2 = call.functionText.match(/^([A-Za-z_]\w*)\./)?.[1];
+    return receiver2 !== void 0 && requestReceiverAt(receiver2, call.scopeId, scopes) && /(?:\.Cookie|\.PathValue|\.Header\.Get|\.URL\.Query\(\)\.Get)$/.test(call.functionText);
+  }).map((call) => ({
+    line: call.line,
+    endLine: call.endLine,
+    origin: `origin:${call.text.replace(/\s+/g, "")}`
+  }));
+  for (const index of descendants(body2, "index_expression")) {
+    const text = sourceText(index, file.current).replace(/\s+/g, "");
+    const receiver2 = text.match(/^([A-Za-z_]\w*)\./)?.[1];
+    if (receiver2 !== void 0 && requestReceiverAt(receiver2, scopeForNode(index, scopes).id, scopes) && (text.startsWith(`${receiver2}.Header[`) || text.startsWith(`${receiver2}.URL.Query()[`))) {
+      requestSources.push({
+        line: index.startPosition.row + 1,
+        endLine: index.endPosition.row + 1,
+        origin: `origin:${text}`
+      });
+    }
+  }
+  for (const selector of descendants(body2, "selector_expression")) {
+    const text = sourceText(selector, file.current);
+    const receiver2 = text.match(/^([A-Za-z_]\w*)\./)?.[1];
+    if (receiver2 !== void 0 && requestReceiverAt(receiver2, scopeForNode(selector, scopes).id, scopes) && /\.URL\.(?:Path|RawPath)$/.test(text)) {
+      requestSources.push({
+        line: selector.startPosition.row + 1,
+        endLine: selector.endPosition.row + 1,
+        origin: `origin:${text.replace(/\s+/g, "")}`
+      });
+    }
+  }
+  return {
+    id: `${file.path}:${node.startPosition.row + 1}:${name2}`,
+    name: name2,
+    path: file.path,
+    file,
+    start: node.startIndex,
+    startLine: node.startPosition.row + 1,
+    source: sourceText(node, file.current),
+    params,
+    assignments,
+    calls,
+    returns,
+    accesses,
+    requestSources: [...new Map(requestSources.map((source) => [`${source.line}:${source.endLine}:${source.origin}`, source])).values()],
+    admissions,
+    capacityGuards,
+    httpAliases,
+    fileAliases,
+    scope,
+    scopes,
+    rootScopeId,
+    receiverCaches
+  };
+}
+function parameters(node, source, httpAliases, sqlAliases) {
+  const result = [];
+  for (const declaration of descendants(node, "parameter_declaration")) {
+    const typeNode = declaration.childForFieldName("type");
+    if (typeNode === null) continue;
+    const type = sourceText(typeNode, source);
+    for (const name2 of declaration.namedChildren.filter((child) => child.type === "identifier" && child.endIndex <= typeNode.startIndex)) {
+      result.push({
+        name: sourceText(name2, source),
+        type,
+        httpRequest: isHttpRequestType(type, httpAliases),
+        sqlDatabase: isSqlDatabaseType(type, sqlAliases)
+      });
+    }
+  }
+  return result;
+}
+function lexicalScopes(body2, source, rootParameters, httpAliases, sqlAliases) {
+  const blocks = descendants(body2, "block").sort((left, right) => left.startIndex - right.startIndex);
+  const result = /* @__PURE__ */ new Map();
+  for (const block of blocks) {
+    const id = `block:${block.startIndex}`;
+    let parentNode = block.parent;
+    while (parentNode !== null && parentNode.type !== "block") parentNode = parentNode.parent;
+    const parent = parentNode === null || !blocks.some((candidate) => candidate.id === parentNode.id) ? void 0 : `block:${parentNode.startIndex}`;
+    let scopeParameters = [];
+    if (block.id === body2.id) {
+      scopeParameters = rootParameters;
+    } else if (block.parent?.type === "func_literal") {
+      const parameterList = block.parent.childForFieldName("parameters");
+      if (parameterList !== null) scopeParameters = parameters(parameterList, source, httpAliases, sqlAliases);
+    } else if (block.parent?.type === "for_statement") {
+      const range = block.parent.namedChildren.find((child) => child.type === "range_clause");
+      if (range !== void 0 && sourceText(range, source).includes(":=")) {
+        const names = range.namedChildren.find((child) => child.type === "expression_list")?.namedChildren ?? [];
+        scopeParameters = names.filter((name2) => name2.type === "identifier").map((name2) => ({
+          name: sourceText(name2, source),
+          type: "",
+          httpRequest: false,
+          sqlDatabase: false
+        }));
+      }
+    }
+    const literal = block.parent?.type === "func_literal" ? block.parent : void 0;
+    const invocation = literal?.parent?.type === "call_expression" && literal.parent.childForFieldName("function")?.id === literal.id ? literal.parent : void 0;
+    const invocationArguments = invocation?.childForFieldName("arguments")?.namedChildren.map((argument) => sourceText(argument, source));
+    result.set(id, {
+      id,
+      ...parent === void 0 ? {} : { parent },
+      start: block.startIndex,
+      end: block.endIndex,
+      parameters: scopeParameters,
+      functionBoundary: block.id === body2.id || block.parent?.type === "func_literal",
+      conditional: block.parent !== null && [
+        "if_statement",
+        "for_statement",
+        "select_statement"
+      ].includes(block.parent.type),
+      ...invocationArguments === void 0 ? {} : { invocationArguments }
+    });
+  }
+  for (const communication of descendants(body2, "communication_case")) {
+    const receive = communication.namedChildren.find((child) => child.type === "receive_statement");
+    if (receive === void 0 || !sourceText(receive, source).includes(":=")) continue;
+    const names = receive.namedChildren.find((child) => child.type === "expression_list")?.namedChildren ?? [];
+    let parentNode = communication.parent;
+    while (parentNode !== null && parentNode.type !== "block") parentNode = parentNode.parent;
+    const parent = parentNode === null ? void 0 : `block:${parentNode.startIndex}`;
+    const id = `case:${communication.startIndex}`;
+    result.set(id, {
+      id,
+      ...parent === void 0 ? {} : { parent },
+      start: communication.startIndex,
+      end: communication.endIndex,
+      parameters: names.filter((name2) => name2.type === "identifier").map((name2) => ({
+        name: sourceText(name2, source),
+        type: "",
+        httpRequest: false,
+        sqlDatabase: false
+      })),
+      functionBoundary: false,
+      conditional: true
+    });
+  }
+  for (const statement of descendants(body2, "type_switch_statement")) {
+    const names = statement.namedChildren.find((child) => child.type === "expression_list")?.namedChildren ?? [];
+    const aliases = names.filter((name2) => name2.type === "identifier").map((name2) => ({
+      name: sourceText(name2, source),
+      type: "",
+      httpRequest: false,
+      sqlDatabase: false
+    }));
+    if (aliases.length === 0 || !sourceText(statement, source).includes(":=")) continue;
+    let parentNode = statement.parent;
+    while (parentNode !== null && parentNode.type !== "block") parentNode = parentNode.parent;
+    const parent = parentNode === null ? void 0 : `block:${parentNode.startIndex}`;
+    for (const item of statement.namedChildren.filter((child) => child.type === "type_case" || child.type === "default_case")) {
+      const id = `case:${item.startIndex}`;
+      result.set(id, {
+        id,
+        ...parent === void 0 ? {} : { parent },
+        start: item.startIndex,
+        end: item.endIndex,
+        parameters: aliases,
+        functionBoundary: false,
+        conditional: true
+      });
+    }
+  }
+  if (result.size === 0) {
+    const id = `block:${body2.startIndex}`;
+    result.set(id, {
+      id,
+      start: body2.startIndex,
+      end: body2.endIndex,
+      parameters: rootParameters,
+      functionBoundary: true,
+      conditional: false
+    });
+  }
+  return result;
+}
+function scopeForNode(node, scopes) {
+  const candidates = [...scopes.values()].filter((scope) => node.startIndex >= scope.start && node.endIndex <= scope.end);
+  return candidates.sort((left, right) => left.end - left.start - (right.end - right.start))[0] ?? [...scopes.values()][0];
+}
+function scopeAncestors(scopes, scopeId) {
+  const result = [];
+  let current = scopeId;
+  while (current !== void 0) {
+    result.unshift(current);
+    current = scopes.get(current)?.parent;
+  }
+  return result;
+}
+function callableScope(scopes, scopeId) {
+  return scopeAncestors(scopes, scopeId).reverse().find((candidate) => scopes.get(candidate)?.functionBoundary) ?? scopeId;
+}
+function conditionallyExecutedRelativeTo(scopes, scopeId, ancestorScopeId) {
+  let current = scopeId;
+  while (current !== void 0 && current !== ancestorScopeId) {
+    const scope = scopes.get(current);
+    if (scope?.conditional) return true;
+    current = scope?.parent;
+  }
+  return false;
+}
+function requestReceiverAt(receiver, scopeId, scopes) {
+  const ancestors = scopeAncestors(scopes, scopeId).reverse();
+  for (const ancestor of ancestors) {
+    const parameter = scopes.get(ancestor)?.parameters.find((candidate) => candidate.name === receiver);
+    if (parameter !== void 0) return parameter.httpRequest;
+  }
+  return false;
+}
+function assignmentFact(source, node, scopeId) {
+  const text = sourceText(node, source);
+  const operator = node.type === "short_var_declaration" ? ":=" : "=";
+  const index = text.indexOf(operator);
+  if (index < 0) return void 0;
+  const targets = splitTopLevel(text.slice(0, index)).map((item) => item.trim());
+  const expressions = splitTopLevel(text.slice(index + operator.length)).map((item) => item.trim());
+  return {
+    targets,
+    expressions,
+    line: node.startPosition.row + 1,
+    start: node.startIndex,
+    end: node.endIndex,
+    visibilityEnd: operator === ":=" && node.parent !== null && [
+      "if_statement",
+      "expression_switch_statement",
+      "type_switch_statement",
+      "for_statement"
+    ].includes(node.parent.type) ? node.parent.endIndex : Number.POSITIVE_INFINITY,
+    scopeId,
+    declaration: operator === ":=",
+    terminatesBranch: enclosingTerminatingBranch(node),
+    ...enclosingIfArm(node)
+  };
+}
+function variableFact(source, node, scopeId) {
+  const values = node.namedChildren.find((child) => child.type === "expression_list");
+  const targets = node.namedChildren.filter((child) => child.type === "identifier" && (values === void 0 || child.endIndex <= values.startIndex)).map((child) => sourceText(child, source));
+  if (targets.length === 0) return void 0;
+  return {
+    targets,
+    expressions: values?.namedChildren.map((child) => sourceText(child, source)) ?? [],
+    line: node.startPosition.row + 1,
+    start: node.startIndex,
+    end: node.endIndex,
+    visibilityEnd: Number.POSITIVE_INFINITY,
+    scopeId,
+    declaration: true,
+    terminatesBranch: enclosingTerminatingBranch(node),
+    ...enclosingIfArm(node)
+  };
+}
+function enclosingIfArm(node) {
+  let current = node;
+  while (current !== null && !["function_declaration", "method_declaration", "func_literal"].includes(current.type)) {
+    if (current.type === "block" && current.parent?.type === "if_statement") {
+      const statement = current.parent;
+      const consequence = statement.childForFieldName("consequence");
+      const alternative = statement.childForFieldName("alternative");
+      if (consequence?.id === current.id || alternative?.id === current.id) {
+        return {
+          branchGroup: `if:${statement.startIndex}`,
+          branchArm: consequence?.id === current.id ? "then" : "else",
+          branchExhaustive: alternative?.type === "block"
+        };
+      }
+    }
+    current = current.parent;
+  }
+  return {};
+}
+function enclosingTerminatingBranch(node) {
+  let current = node.parent;
+  while (current !== null && current.type !== "function_declaration" && current.type !== "method_declaration" && current.type !== "func_literal") {
+    if (current.type === "block") {
+      if (current.parent !== null && ["function_declaration", "method_declaration", "func_literal"].includes(current.parent.type)) {
+        return false;
+      }
+      if (blockTerminates(current)) return true;
+    }
+    current = current.parent;
+  }
+  return false;
+}
+function callFact(source, node, scopeId) {
+  const fn = node.childForFieldName("function");
+  const args2 = node.childForFieldName("arguments");
+  if (fn === null || args2 === null) return void 0;
+  const functionText = sourceText(fn, source).replace(/\s+/g, "");
+  const name2 = functionText.match(/([A-Za-z_]\w*)$/)?.[1];
+  if (name2 === void 0) return void 0;
+  const guard = commaOkGuard(node, source);
+  return {
+    name: name2,
+    functionText,
+    args: args2.namedChildren.map((argument) => sourceText(argument, source)),
+    line: node.startPosition.row + 1,
+    endLine: node.endPosition.row + 1,
+    text: sourceText(node, source).trim(),
+    start: node.startIndex,
+    scopeId,
+    executable: nodeIsReachable(node) && !insideUninvokedFunctionLiteral(node),
+    hitEscape: guard?.kind === "hit",
+    ...guard?.kind === "miss" ? { missBranch: guard.branch } : {}
+  };
+}
+function insideUninvokedFunctionLiteral(node) {
+  let current = node.parent;
+  while (current !== null && !["function_declaration", "method_declaration"].includes(current.type)) {
+    if (current.type === "func_literal") {
+      let wrapper = current;
+      while (wrapper.parent !== null && wrapper.parent.type === "parenthesized_expression") wrapper = wrapper.parent;
+      const parent = wrapper.parent;
+      const directlyInvoked = parent?.type === "call_expression" && parent.childForFieldName("function")?.id === wrapper.id;
+      const passedToCall = parent?.type === "argument_list" && parent.parent?.type === "call_expression";
+      const assignedAndInvoked = localFunctionLiteralDefinitelyInvoked(current);
+      if (!directlyInvoked && !passedToCall && !assignedAndInvoked) return true;
+    }
+    current = current.parent;
+  }
+  return false;
+}
+function localFunctionLiteralDefinitelyInvoked(literal) {
+  let assignment = literal.parent;
+  while (assignment !== null && !["short_var_declaration", "assignment_statement", "var_spec"].includes(assignment.type)) {
+    if (["statement_list", "block", "func_literal", "function_declaration", "method_declaration"].includes(assignment.type)) {
+      return false;
+    }
+    assignment = assignment.parent;
+  }
+  if (assignment === null) return false;
+  const statementList = assignment.parent?.type === "statement_list" ? assignment.parent : assignment.parent?.parent?.type === "statement_list" ? assignment.parent.parent : void 0;
+  if (statementList === void 0) return false;
+  const name2 = assignedSingleIdentifier(assignment);
+  if (name2 === void 0) return false;
+  const laterStatements = statementList.namedChildren.filter((statement) => statement.startIndex > assignment.endIndex);
+  for (const statement of laterStatements) {
+    if (declarationAssignsName(statement, name2)) return false;
+    const call = directInvocationStatement(statement);
+    if (call?.childForFieldName("function")?.type === "identifier" && call.childForFieldName("function").text === name2) return true;
+  }
+  return false;
+}
+function assignedSingleIdentifier(declaration) {
+  const left = declaration.type === "var_spec" ? declaration.namedChildren.filter((child) => child.type === "identifier") : declaration.childForFieldName("left")?.namedChildren ?? [];
+  if (left.length !== 1 || left[0]?.type !== "identifier") return void 0;
+  return left[0].text;
+}
+function declarationAssignsName(statement, name2) {
+  return descendants(statement, "short_var_declaration").concat(descendants(statement, "assignment_statement")).concat(descendants(statement, "var_spec")).some((declaration) => {
+    if (declaration.type === "var_spec") return declaration.namedChildren.some((child) => child.type === "identifier" && child.text === name2);
+    return (declaration.childForFieldName("left")?.namedChildren ?? []).some((child) => child.type === "identifier" && child.text === name2);
+  });
+}
+function directInvocationStatement(statement) {
+  let candidate = statement;
+  if (["go_statement", "defer_statement", "expression_statement"].includes(candidate.type)) {
+    candidate = candidate.namedChildren[0] ?? candidate;
+  }
+  return candidate.type === "call_expression" ? candidate : void 0;
+}
+function nodeIsReachable(node) {
+  let current = node;
+  while (current?.parent !== null && current?.parent !== void 0) {
+    const parent = current.parent;
+    if (parent.type === "statement_list") {
+      const index = parent.namedChildren.findIndex((candidate) => candidate.id === current.id);
+      if (index >= 0 && parent.namedChildren.slice(0, index).some(statementAlwaysTerminates)) return false;
+    }
+    current = parent;
+  }
+  return true;
+}
+function statementAlwaysTerminates(node) {
+  if (["return_statement", "break_statement", "continue_statement", "goto_statement"].includes(node.type)) return true;
+  if (node.type !== "if_statement") return false;
+  const consequence = node.childForFieldName("consequence");
+  const alternative = node.childForFieldName("alternative");
+  return consequence !== null && alternative !== null && blockTerminates(consequence) && (alternative.type === "if_statement" ? statementAlwaysTerminates(alternative) : blockTerminates(alternative));
+}
+function commaOkGuard(value, source) {
+  let assignment = value.parent;
+  while (assignment !== null && assignment.type !== "short_var_declaration" && assignment.type !== "assignment_statement") {
+    if (assignment.type === "statement_list" || assignment.type === "block") return void 0;
+    assignment = assignment.parent;
+  }
+  if (assignment === null) return void 0;
+  const right = assignment.childForFieldName("right")?.namedChildren ?? [];
+  if (right.length !== 1 || right[0].id !== value.id) return void 0;
+  const left = assignment.childForFieldName("left")?.namedChildren ?? [];
+  const okNode = left[1];
+  if (left.length !== 2 || okNode?.type !== "identifier") return void 0;
+  const ok = sourceText(okNode, source);
+  let guard;
+  if (assignment.parent?.type === "if_statement") {
+    guard = assignment.parent;
+  } else if (assignment.parent?.type === "statement_list") {
+    const siblings = assignment.parent.namedChildren;
+    const index = siblings.findIndex((candidate2) => candidate2.id === assignment.id);
+    const candidate = siblings[index + 1];
+    if (candidate?.type === "if_statement") guard = candidate;
+  }
+  if (guard === void 0) return void 0;
+  const condition = guard.childForFieldName("condition");
+  const consequence = guard.childForFieldName("consequence");
+  if (condition === null || consequence === null) return void 0;
+  const compact = sourceText(condition, source).replace(/\s+/g, "").replace(/^\((.*)\)$/, "$1");
+  if (compact === ok && blockTerminates(consequence)) return { kind: "hit" };
+  if (compact === `!${ok}`) {
+    return { kind: "miss", branch: { start: consequence.startIndex, end: consequence.endIndex } };
+  }
+  return void 0;
+}
+function blockTerminates(block) {
+  const statements = block.namedChildren.find((node) => node.type === "statement_list")?.namedChildren ?? [];
+  const final = statements.at(-1);
+  return final !== void 0 && ["return_statement", "continue_statement"].includes(final.type);
+}
+function fixedAdmissions(source, body2, scopes) {
+  const result = [];
+  for (const statement of descendants(body2, "expression_switch_statement")) {
+    if (statement.childForFieldName("initializer") !== null) continue;
+    const key = statement.childForFieldName("value");
+    if (key === null) continue;
+    const cases = statement.namedChildren.filter((node) => node.type === "expression_case");
+    const defaultCase = statement.namedChildren.find((node) => node.type === "default_case");
+    if (cases.length === 0 || defaultCase === void 0 || !caseTerminates(defaultCase)) continue;
+    const finite = cases.every((item) => {
+      const expressions = item.namedChildren.find((node) => node.type === "expression_list")?.namedChildren ?? [];
+      return expressions.length > 0 && expressions.every((expression) => expression.type === "interpreted_string_literal" || expression.type === "raw_string_literal");
+    });
+    if (!finite) continue;
+    result.push({
+      key: sourceText(key, source),
+      start: statement.startIndex,
+      scopeId: scopeForNode(statement, scopes).id
+    });
+  }
+  return result;
+}
+function caseTerminates(caseNode) {
+  const statements = caseNode.namedChildren.find((node) => node.type === "statement_list")?.namedChildren ?? [];
+  const final = statements.at(-1);
+  return final?.type === "return_statement";
+}
+function capacityGuardFacts(source, body2, scopes) {
+  const result = [];
+  for (const statement of descendants(body2, "if_statement")) {
+    const condition = statement.childForFieldName("condition");
+    const consequence = statement.childForFieldName("consequence");
+    if (condition === null || consequence === null) continue;
+    if (identifierShadowedAt(statement, "len", source)) continue;
+    const match = sourceText(condition, source).replace(/\s+/g, "").match(/^len\(([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\)(?:>=|>)([0-9][0-9A-Fa-f_xXoObB]*|[A-Za-z_]\w*)$/);
+    if (match === null) continue;
+    const returns = blockTerminates(consequence);
+    const evicts = evictsRangedEntry(consequence, source, match[1]);
+    if (!returns && !evicts) continue;
+    result.push({
+      cache: match[1],
+      bound: match[2],
+      start: statement.startIndex,
+      end: statement.endIndex,
+      scopeId: scopeForNode(statement, scopes).id,
+      kind: returns ? "return" : "ranged-eviction"
+    });
+  }
+  return result;
+}
+function identifierShadowedAt(reference, name2, source) {
+  let callable = reference;
+  while (callable !== null && !["function_declaration", "method_declaration", "func_literal"].includes(callable.type)) {
+    callable = callable.parent;
+  }
+  if (callable !== null) {
+    const parameterLists = [callable.childForFieldName("receiver"), callable.childForFieldName("parameters")];
+    if (parameterLists.some((list) => list !== null && descendants(list, "parameter_declaration").some((parameter) => declaredNames(parameter, source).includes(name2)))) return true;
+    const body2 = callable.childForFieldName("body");
+    if (body2 !== null) {
+      const declarations = [
+        ...descendants(body2, "short_var_declaration"),
+        ...descendants(body2, "var_spec"),
+        ...descendants(body2, "range_clause"),
+        ...descendants(body2, "receive_statement"),
+        ...descendants(body2, "type_switch_statement")
+      ];
+      if (declarations.some((declaration) => declaration.startIndex < reference.startIndex && declarationVisibleAt(declaration, reference) && declaredNames(declaration, source).includes(name2))) return true;
+    }
+  }
+  let root = reference;
+  while (root.parent !== null) root = root.parent;
+  return [
+    ...descendants(root, "var_spec"),
+    ...descendants(root, "const_spec"),
+    ...descendants(root, "function_declaration"),
+    ...descendants(root, "type_spec")
+  ].some((declaration) => {
+    if (declaration.type !== "function_declaration" && declaration.parent?.parent?.type !== "source_file" && declaration.parent?.type !== "source_file") return false;
+    return declaredNames(declaration, source).includes(name2);
+  });
+}
+function declaredNames(declaration, source) {
+  if (declaration.type === "function_declaration" || declaration.type === "type_spec") {
+    const name2 = declaration.childForFieldName("name");
+    return name2 === null ? [] : [sourceText(name2, source)];
+  }
+  if (declaration.type === "range_clause" || declaration.type === "receive_statement" || declaration.type === "type_switch_statement") {
+    if (!sourceText(declaration, source).includes(":=")) return [];
+    const selected = declaration.type === "type_switch_statement" ? declaration.namedChildren.find((child) => child.type === "expression_list")?.namedChildren : declaration.childForFieldName("left")?.namedChildren;
+    return (selected ?? []).filter((child) => child.type === "identifier").map((child) => sourceText(child, source));
+  }
+  const type = declaration.childForFieldName("type");
+  const left = declaration.childForFieldName("left")?.namedChildren;
+  const children = left ?? declaration.namedChildren;
+  return children.filter((child) => child.type === "identifier" && (type === null || child.endIndex <= type.startIndex)).map((child) => sourceText(child, source));
+}
+function declarationVisibleAt(declaration, reference) {
+  let scope = declaration.parent;
+  const lexicalScopes2 = /* @__PURE__ */ new Set([
+    "block",
+    "source_file",
+    "if_statement",
+    "for_statement",
+    "expression_switch_statement",
+    "type_switch_statement",
+    "expression_case",
+    "type_case",
+    "communication_case"
+  ]);
+  while (scope !== null && !lexicalScopes2.has(scope.type)) scope = scope.parent;
+  return scope !== null && reference.startIndex >= scope.startIndex && reference.endIndex <= scope.endIndex;
+}
+function evictsRangedEntry(consequence, source, cache) {
+  const topLevel = consequence.namedChildren.find((node) => node.type === "statement_list")?.namedChildren ?? [];
+  return topLevel.some((statement) => {
+    if (statement.type !== "for_statement") return false;
+    const clause = statement.namedChildren.find((node) => node.type === "range_clause");
+    const loopBody = statement.childForFieldName("body") ?? statement.namedChildren.find((node) => node.type === "block");
+    if (clause === void 0 || loopBody === null || loopBody === void 0) return false;
+    const ranged = clause.namedChildren.at(-1);
+    const names = clause.namedChildren.find((node) => node.type === "expression_list")?.namedChildren ?? [];
+    const victim = names[0];
+    if (ranged === void 0 || sourceText(ranged, source).replace(/\s+/g, "") !== cache || victim?.type !== "identifier") {
+      return false;
+    }
+    const loopStatements = loopBody.namedChildren.find((node) => node.type === "statement_list")?.namedChildren ?? [];
+    if (loopStatements.at(-1)?.type !== "break_statement") return false;
+    const victimName = sourceText(victim, source);
+    return loopStatements.slice(0, -1).some((loopStatement) => {
+      if (loopStatement.type !== "expression_statement") return false;
+      const call = loopStatement.namedChildren[0];
+      if (call?.type !== "call_expression") return false;
+      const fn = call.childForFieldName("function");
+      const args2 = call.childForFieldName("arguments")?.namedChildren ?? [];
+      return fn?.type === "identifier" && sourceText(fn, source) === "delete" && args2.length === 2 && sourceText(args2[0], source).replace(/\s+/g, "") === cache && sourceText(args2[1], source) === victimName;
+    });
+  });
+}
+function cacheAccesses(source, body2, scopes) {
+  const insertions = /* @__PURE__ */ new Map();
+  for (const assignment of descendants(body2, "assignment_statement")) {
+    if (!nodeIsReachable(assignment) || insideUninvokedFunctionLiteral(assignment)) continue;
+    const text = sourceText(assignment, source);
+    const left = text.slice(0, text.indexOf("="));
+    for (const match of left.matchAll(/([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\s*\[([^\]]+)\]/g)) {
+      const cacheText = match[1];
+      const access = {
+        cacheText,
+        key: match[2].trim(),
+        line: assignment.startPosition.row + 1,
+        endLine: assignment.endPosition.row + 1,
+        text: text.trim(),
+        value: text.slice(text.indexOf("=") + 1).trim(),
+        kind: "insert",
+        start: assignment.startIndex,
+        end: assignment.endIndex,
+        scopeId: scopeForNode(assignment, scopes).id,
+        hitEscape: false
+      };
+      insertions.set(`${assignment.startIndex}:${cacheText}`, access);
+    }
+  }
+  const accesses = [...insertions.values()];
+  for (const index of descendants(body2, "index_expression")) {
+    if (!nodeIsReachable(index) || insideUninvokedFunctionLiteral(index)) continue;
+    const text = sourceText(index, source);
+    const match = text.match(/^\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\s*\[([\s\S]+)\]\s*$/);
+    if (match === null) continue;
+    const cacheText = match[1];
+    const isInsertion = [...insertions.values()].some((item) => item.line === index.startPosition.row + 1 && item.cacheText === cacheText);
+    if (isInsertion) continue;
+    const guard = commaOkGuard(index, source);
+    accesses.push({
+      cacheText,
+      key: match[2].trim(),
+      line: index.startPosition.row + 1,
+      endLine: index.endPosition.row + 1,
+      text: text.trim(),
+      value: "",
+      kind: "lookup",
+      start: index.startIndex,
+      end: index.endIndex,
+      scopeId: scopeForNode(index, scopes).id,
+      hitEscape: guard?.kind === "hit",
+      ...guard?.kind === "miss" ? { missBranch: guard.branch } : {}
+    });
+  }
+  return accesses.sort((left, right) => left.line - right.line);
+}
+function resolveCacheAt(fn, expression, position, scopeId, caches) {
+  const aliases = /* @__PURE__ */ new Map();
+  for (const cache of caches.values()) {
+    const globalPrefix = `global:${fn.scope}:`;
+    if (cache.id.startsWith(globalPrefix)) aliases.set(cache.id.slice(globalPrefix.length), cache.id);
+  }
+  for (const [selector, cacheId] of fn.receiverCaches) aliases.set(selector, cacheId);
+  const ancestors = scopeAncestors(fn.scopes, scopeId);
+  for (const parameter of fn.scopes.get(fn.rootScopeId)?.parameters ?? []) {
+    if (!fn.receiverCaches.has(parameter.name)) aliases.delete(parameter.name);
+  }
+  const assignments = fn.assignments.filter((item) => item.start < position && position <= item.visibilityEnd && ancestors.includes(item.scopeId));
+  const shadows = ancestors.filter((ancestor) => ancestor !== fn.rootScopeId).flatMap((ancestor) => (fn.scopes.get(ancestor)?.parameters ?? []).map((parameter, index) => ({
+    start: fn.scopes.get(ancestor).start,
+    name: parameter.name,
+    argument: fn.scopes.get(ancestor)?.invocationArguments?.[index]
+  })));
+  const positions = [.../* @__PURE__ */ new Set([
+    ...assignments.map((assignment) => assignment.start),
+    ...shadows.map((shadow) => shadow.start)
+  ])].sort((left, right) => left - right);
+  for (const eventPosition of positions) {
+    for (const shadow of shadows.filter((candidate) => candidate.start === eventPosition)) {
+      const cacheId = shadow.argument === void 0 ? void 0 : aliases.get(shadow.argument.replace(/\s+/g, ""));
+      if (cacheId === void 0) aliases.delete(shadow.name);
+      else aliases.set(shadow.name, cacheId);
+      for (const name2 of [...aliases.keys()]) if (name2.startsWith(`${shadow.name}.`)) aliases.delete(name2);
+    }
+    for (const assignment of assignments.filter((candidate) => candidate.start === eventPosition)) {
+      assignment.targets.forEach((target, index) => {
+        if (!/^[A-Za-z_]\w*$/.test(target) || target === "_") return;
+        const value = assignment.expressions[index] ?? (index === 0 ? assignment.expressions[0] : void 0);
+        const normalized = value?.replace(/\s+/g, "");
+        const cacheId = normalized === void 0 ? void 0 : aliases.get(normalized);
+        if (cacheId === void 0) aliases.delete(target);
+        else aliases.set(target, cacheId);
+      });
+    }
+  }
+  return aliases.get(expression.replace(/\s+/g, ""));
+}
+function uniqueFunctionsByName(functions) {
+  const grouped = /* @__PURE__ */ new Map();
+  for (const fn of functions) grouped.set(fn.name, [...grouped.get(fn.name) ?? [], fn]);
+  return new Map([...grouped].filter(([, values]) => values.length === 1).map(([name2, values]) => [name2, values[0]]));
+}
+function calculateReturnDependencies(functions, byName) {
+  const summaries = /* @__PURE__ */ new Map();
+  for (let pass = 0; pass < functions.length + 2; pass += 1) {
+    let changed2 = false;
+    for (const fn of functions) {
+      const seeds = /* @__PURE__ */ new Map();
+      fn.params.forEach((parameter, index) => seeds.set(parameter.name, /* @__PURE__ */ new Set([`p:${index}`])));
+      const next = union(...fn.returns.filter((item) => item.scopeId === fn.rootScopeId).flatMap((item) => {
+        const env = environmentAt(fn, item.start, item.scopeId, seeds, byName, summaries);
+        return item.expressions.map((expression) => expressionDependencies(expression, env, byName, summaries));
+      }));
+      if (!sameDependencies(next, summaries.get(fn.id) ?? /* @__PURE__ */ new Set())) {
+        summaries.set(fn.id, next);
+        changed2 = true;
+      }
+    }
+    if (!changed2) break;
+  }
+  return summaries;
+}
+function calculateRequestParameterSeeds(functions, byName, summaries) {
+  const seeds = /* @__PURE__ */ new Map();
+  for (const fn of functions) {
+    const map = /* @__PURE__ */ new Map();
+    fn.params.forEach((parameter, index) => {
+      const dependencies = /* @__PURE__ */ new Set([`p:${index}`]);
+      if (parameter.httpRequest) dependencies.add("request-object");
+      map.set(parameter.name, dependencies);
+    });
+    seeds.set(fn.id, map);
+  }
+  for (let pass = 0; pass < functions.length + 2; pass += 1) {
+    let changed2 = false;
+    for (const caller of functions) {
+      for (const call of caller.calls) {
+        const callee = byName.get(call.name);
+        if (callee === void 0) continue;
+        const env = environmentAt(caller, call.start, call.scopeId, seeds.get(caller.id) ?? /* @__PURE__ */ new Map(), byName, summaries);
+        const target = seeds.get(callee.id);
+        call.args.forEach((argument, index) => {
+          const parameter = callee.params[index];
+          if (parameter === void 0) return;
+          const deps = expressionDependencies(argument, env, byName, summaries);
+          const propagated = new Set([...deps].filter((dep) => dep === "request" || dep === "request-object" || dep.startsWith("origin:")));
+          if (propagated.size === 0) return;
+          const existing = target.get(parameter.name) ?? /* @__PURE__ */ new Set();
+          const combined = union(existing, propagated);
+          if (!sameDependencies(existing, combined)) {
+            target.set(parameter.name, combined);
+            changed2 = true;
+          }
+        });
+      }
+    }
+    if (!changed2) break;
+  }
+  return seeds;
+}
+function environmentAt(fn, position, scopeId, seeds, byName, summaries) {
+  const env = /* @__PURE__ */ new Map();
+  for (const [name2, deps] of seeds) env.set(name2, new Set(deps));
+  const ancestors = scopeAncestors(fn.scopes, scopeId);
+  const assignments = fn.assignments.filter((item) => {
+    if (item.start >= position || position > item.visibilityEnd) return false;
+    if (ancestors.includes(item.scopeId)) return true;
+    return !item.declaration && !item.terminatesBranch && callableScope(fn.scopes, item.scopeId) === callableScope(fn.scopes, scopeId);
+  });
+  const shadows = ancestors.filter((ancestor) => ancestor !== fn.rootScopeId).flatMap((ancestor) => (fn.scopes.get(ancestor)?.parameters ?? []).map((parameter, index) => ({
+    start: fn.scopes.get(ancestor).start,
+    parameter,
+    argument: fn.scopes.get(ancestor)?.invocationArguments?.[index]
+  })));
+  const positions = [.../* @__PURE__ */ new Set([
+    ...assignments.map((assignment) => assignment.start),
+    ...shadows.map((shadow) => shadow.start)
+  ])].sort((left, right) => left - right);
+  const handledBranches = /* @__PURE__ */ new Set();
+  for (const eventPosition of positions) {
+    for (const { parameter, argument } of shadows.filter((shadow) => shadow.start === eventPosition)) {
+      const deps = argument === void 0 ? /* @__PURE__ */ new Set() : expressionDependencies(argument, env, byName, summaries);
+      if (argument === void 0 && parameter.httpRequest) deps.add("request-object");
+      env.set(parameter.name, deps);
+    }
+    for (const assignment of assignments.filter((candidate) => candidate.start === eventPosition)) {
+      if (assignment.branchGroup !== void 0 && assignment.branchExhaustive === true) {
+        if (handledBranches.has(assignment.branchGroup)) continue;
+        const grouped = assignments.filter((candidate) => candidate.branchGroup === assignment.branchGroup);
+        const thenAssignments = grouped.filter((candidate) => candidate.branchArm === "then");
+        const elseAssignments = grouped.filter((candidate) => candidate.branchArm === "else");
+        if (thenAssignments.length > 0 && elseAssignments.length > 0) {
+          const base = new Map([...env].map(([name2, deps]) => [name2, new Set(deps)]));
+          const thenEnvironment = replayDependencyAssignments(thenAssignments, base, byName, summaries);
+          const elseEnvironment = replayDependencyAssignments(elseAssignments, base, byName, summaries);
+          const names = /* @__PURE__ */ new Set([
+            ...thenAssignments.flatMap((candidate) => candidate.targets),
+            ...elseAssignments.flatMap((candidate) => candidate.targets)
+          ]);
+          for (const name2 of names) {
+            if (!/^[A-Za-z_]\w*$/.test(name2) || name2 === "_") continue;
+            env.set(name2, union(thenEnvironment.get(name2) ?? /* @__PURE__ */ new Set(), elseEnvironment.get(name2) ?? /* @__PURE__ */ new Set()));
+          }
+          handledBranches.add(assignment.branchGroup);
+          continue;
+        }
+      }
+      const next = /* @__PURE__ */ new Map();
+      assignment.targets.forEach((target, index) => {
+        if (!/^[A-Za-z_]\w*$/.test(target) || target === "_") return;
+        const expression = assignment.expressions[index] ?? (index === 0 ? assignment.expressions[0] : void 0);
+        next.set(target, expression === void 0 ? /* @__PURE__ */ new Set() : assignedDependencies(expression, env, byName, summaries));
+      });
+      const conditional = !ancestors.includes(assignment.scopeId) && conditionallyExecutedRelativeTo(fn.scopes, assignment.scopeId, scopeId);
+      for (const [target, deps] of next) {
+        env.set(target, conditional ? union(env.get(target) ?? /* @__PURE__ */ new Set(), deps) : deps);
+      }
+    }
+  }
+  return env;
+}
+function replayDependencyAssignments(assignments, base, byName, summaries) {
+  const environment = new Map([...base].map(([name2, deps]) => [name2, new Set(deps)]));
+  for (const assignment of assignments.sort((left, right) => left.start - right.start)) {
+    const next = /* @__PURE__ */ new Map();
+    assignment.targets.forEach((target, index) => {
+      if (!/^[A-Za-z_]\w*$/.test(target) || target === "_") return;
+      const expression = assignment.expressions[index] ?? (index === 0 ? assignment.expressions[0] : void 0);
+      next.set(target, expression === void 0 ? /* @__PURE__ */ new Set() : assignedDependencies(expression, environment, byName, summaries));
+    });
+    for (const [target, deps] of next) environment.set(target, deps);
+  }
+  return environment;
+}
+function assignedDependencies(expression, env, byName, summaries) {
+  const dependencies = expressionDependencies(expression, env, byName, summaries);
+  if (requestOrigins(dependencies).size === 0 || /^\s*\(?[A-Za-z_]\w*\)?\s*$/.test(expression)) return dependencies;
+  for (const dependency of [...dependencies]) if (dependency.startsWith("value:")) dependencies.delete(dependency);
+  dependencies.add(valueIdentity(expression, env));
+  return dependencies;
+}
+function valueIdentity(expression, environment) {
+  let canonical = maskGoNonCode(expression, false).replace(/\s+/g, "");
+  const identifiers = [...environment.keys()].sort((left, right) => right.length - left.length);
+  for (const identifier of identifiers) {
+    const dependencies = environment.get(identifier) ?? /* @__PURE__ */ new Set();
+    const values = [...dependencies].filter((dependency) => dependency.startsWith("value:")).sort();
+    const parameters2 = [...dependencies].filter((dependency) => /^p:\d+$/.test(dependency)).sort();
+    const origins = [...dependencies].filter((dependency) => dependency.startsWith("origin:")).sort();
+    const identity = values.length > 0 ? values : parameters2.length > 0 ? parameters2 : origins;
+    if (identity.length === 0) continue;
+    canonical = canonical.replace(new RegExp(`\\b${escapeRegExp(identifier)}\\b`, "g"), `{${identity.join("|")}}`);
+  }
+  return `value:canonical:${canonical}`;
+}
+function expressionDependencies(expression, env, byName, summaries) {
+  const executable = maskGoNonCode(expression);
+  const deps = /* @__PURE__ */ new Set();
+  const requestReceivers = [...env].filter(([, value]) => value.has("request-object")).map(([name2]) => name2);
+  for (const receiver of requestReceivers) {
+    const escaped = escapeRegExp(receiver);
+    const sourcePattern = new RegExp(
+      `\\b${escaped}(?:\\.(?:Cookie|PathValue)\\s*\\([^)]*\\)|\\.Header\\.Get\\s*\\([^)]*\\)|\\.URL\\.Query\\s*\\(\\s*\\)\\.Get\\s*\\([^)]*\\)|\\.(?:Header|URL\\.Query\\s*\\(\\s*\\))\\s*\\[[^\\]]+\\]|\\.URL\\.(?:Path|RawPath))`,
+      "g"
+    );
+    for (const match of executable.matchAll(sourcePattern)) {
+      deps.add("request");
+      const original = expression.slice(match.index ?? 0, (match.index ?? 0) + match[0].length);
+      deps.add(`origin:${original.replace(/\s+/g, "")}`);
+    }
+  }
+  for (const identifier of executable.match(/[A-Za-z_]\w*/g) ?? []) {
+    for (const dependency of env.get(identifier) ?? []) deps.add(dependency);
+  }
+  const call = parseOuterCall(executable);
+  if (call !== void 0) {
+    const callee = byName.get(call.name);
+    if (callee !== void 0) {
+      for (const dependency of summaries.get(callee.id) ?? []) {
+        const parameter = dependency.match(/^p:(\d+)$/)?.[1];
+        if (parameter === void 0) {
+          deps.add(dependency);
+          continue;
+        }
+        const argument = call.args[Number(parameter)];
+        if (argument === void 0) continue;
+        for (const mapped of expressionDependencies(argument, env, byName, summaries)) deps.add(mapped);
+      }
+    }
+  }
+  if (requestOrigins(deps).size > 0 && !/^\s*\(?[A-Za-z_]\w*\)?\s*$/.test(expression)) {
+    deps.add(valueIdentity(expression, env));
+  }
+  return deps;
+}
+function requestOrigins(dependencies) {
+  return new Set([...dependencies].filter((item) => item.startsWith("origin:")));
+}
+function sameRequestOrigin(left, right) {
+  const leftOrigins = new Set([...left].filter((item) => item.startsWith("origin:")));
+  const rightOrigins = new Set([...right].filter((item) => item.startsWith("origin:")));
+  if (![...leftOrigins].some((item) => rightOrigins.has(item))) return false;
+  const leftParameters = new Set([...left].filter((item) => /^p:\d+$/.test(item)));
+  const rightParameters = new Set([...right].filter((item) => /^p:\d+$/.test(item)));
+  if (leftParameters.size > 0 && rightParameters.size > 0 && ![...leftParameters].some((item) => rightParameters.has(item))) return false;
+  const leftValues = new Set([...left].filter((item) => item.startsWith("value:")));
+  const rightValues = new Set([...right].filter((item) => item.startsWith("value:")));
+  if (leftValues.size > 0 || rightValues.size > 0) {
+    return [...leftValues].some((item) => rightValues.has(item));
+  }
+  return true;
+}
+function requestCallEdges(functions, byName, summaries, seeds) {
+  const edges = [];
+  for (const caller of functions) {
+    for (const call of caller.calls) {
+      const callee = byName.get(call.name);
+      if (callee === void 0) continue;
+      const env = environmentAt(caller, call.start, call.scopeId, seeds.get(caller.id) ?? /* @__PURE__ */ new Map(), byName, summaries);
+      if (call.args.some((argument) => requestOrigins(expressionDependencies(argument, env, byName, summaries)).size > 0)) {
+        edges.push({
+          caller,
+          callee,
+          line: call.line,
+          endLine: call.endLine,
+          start: call.start,
+          scopeId: call.scopeId,
+          call
+        });
+      }
+    }
+  }
+  return edges;
+}
+function mapParameterDependencies(dependencies, call, environment, byName, summaries) {
+  const mapped = /* @__PURE__ */ new Set();
+  let mappedParameter = false;
+  for (const dependency of dependencies) {
+    const parameter = dependency.match(/^p:(\d+)$/)?.[1];
+    if (parameter === void 0) continue;
+    const argument = call.args[Number(parameter)];
+    if (argument === void 0) continue;
+    mappedParameter = true;
+    for (const item of expressionDependencies(argument, environment, byName, summaries)) mapped.add(item);
+  }
+  return mappedParameter ? mapped : new Set(dependencies);
+}
+function cacheLookupSummaries(functions, byName, returnDependencies, caches) {
+  const summaries = /* @__PURE__ */ new Map();
+  for (const fn of functions) {
+    const seeds = /* @__PURE__ */ new Map();
+    fn.params.forEach((parameter, index) => seeds.set(parameter.name, /* @__PURE__ */ new Set([`p:${index}`])));
+    for (const access of fn.accesses.filter((item) => item.kind === "lookup")) {
+      const cacheId = resolveCacheAt(fn, access.cacheText, access.start, access.scopeId, caches);
+      if (cacheId === void 0) continue;
+      access.cacheId = cacheId;
+      const env = environmentAt(fn, access.start, access.scopeId, seeds, byName, returnDependencies);
+      const deps = expressionDependencies(access.key, env, byName, returnDependencies);
+      for (const dependency of deps) {
+        const index = dependency.match(/^p:(\d+)$/)?.[1];
+        if (index !== void 0) summaries.set(fn.name, [...summaries.get(fn.name) ?? [], { cacheId, parameter: Number(index) }]);
+      }
+    }
+  }
+  return summaries;
+}
+function findCacheLookup(fn, insertion, keyOrigins, seeds, summaries, byName, returnDependencies, caches) {
+  const direct = fn.accesses.find((item) => {
+    if (item.kind !== "lookup" || item.start >= insertion.start) return false;
+    const cacheId = resolveCacheAt(fn, item.cacheText, item.start, item.scopeId, caches);
+    if (cacheId === void 0 || cacheId !== insertion.cacheId) return false;
+    item.cacheId = cacheId;
+    const env = environmentAt(fn, item.start, item.scopeId, seeds, byName, returnDependencies);
+    const protectedMiss = item.hitEscape || item.missBranch !== void 0 && insertion.start > item.missBranch.start && insertion.end < item.missBranch.end;
+    return protectedMiss && sameRequestOrigin(expressionDependencies(item.key, env, byName, returnDependencies), keyOrigins);
+  });
+  if (direct !== void 0) return direct;
+  for (const call of fn.calls.filter((item) => item.start < insertion.start)) {
+    for (const summary of summaries.get(call.name) ?? []) {
+      if (summary.cacheId !== insertion.cacheId) continue;
+      const argument = call.args[summary.parameter];
+      const env = environmentAt(fn, call.start, call.scopeId, seeds, byName, returnDependencies);
+      const protectedMiss = call.hitEscape || call.missBranch !== void 0 && insertion.start > call.missBranch.start && insertion.end < call.missBranch.end;
+      if (argument !== void 0 && protectedMiss && sameRequestOrigin(
+        expressionDependencies(argument, env, byName, returnDependencies),
+        keyOrigins
+      )) {
+        return {
+          line: call.line,
+          endLine: call.endLine,
+          text: call.text,
+          start: call.start,
+          scopeId: call.scopeId
+        };
+      }
+    }
+  }
+  return void 0;
+}
+function findMaterialWork(fn, insertion, lookup, keyOrigins, seeds, byName, summaries) {
+  return fn.calls.find((call) => {
+    if (call.start <= lookup.start || call.start >= insertion.end || !isMaterialCall(call, fn)) return false;
+    const env = environmentAt(fn, call.start, call.scopeId, seeds, byName, summaries);
+    return materialFeedsInsertion(fn, call, insertion) && call.args.some((argument) => sameRequestOrigin(expressionDependencies(argument, env, byName, summaries), keyOrigins));
+  });
+}
+function materialFeedsInsertion(fn, call, insertion) {
+  if (call.start >= insertion.start && call.start < insertion.end && new RegExp(`\\b${escapeRegExp(call.functionText)}\\s*\\(`).test(maskGoNonCode(insertion.value))) return true;
+  const values = /* @__PURE__ */ new Map();
+  const ancestors = scopeAncestors(fn.scopes, insertion.scopeId);
+  const assignments = fn.assignments.filter((item) => item.line >= call.line && item.start < insertion.start && (ancestors.includes(item.scopeId) || !item.declaration && !item.terminatesBranch && callableScope(fn.scopes, item.scopeId) === callableScope(fn.scopes, insertion.scopeId))).sort((left, right) => left.start - right.start);
+  const shadowEvents = ancestors.filter((scopeId) => scopeId !== fn.rootScopeId).flatMap((scopeId) => (fn.scopes.get(scopeId)?.parameters ?? []).map((parameter) => ({
+    start: fn.scopes.get(scopeId).start,
+    name: parameter.name
+  })));
+  const positions = [
+    .../* @__PURE__ */ new Set([...assignments.map((item) => item.start), ...shadowEvents.map((item) => item.start)])
+  ].sort((a, b) => a - b);
+  const handledBranches = /* @__PURE__ */ new Set();
+  for (const position of positions) {
+    for (const shadow of shadowEvents.filter((item) => item.start === position)) values.set(shadow.name, false);
+    for (const assignment of assignments.filter((item) => item.start === position)) {
+      if (assignment.branchGroup !== void 0 && assignment.branchExhaustive === true) {
+        if (handledBranches.has(assignment.branchGroup)) continue;
+        const grouped = assignments.filter((candidate) => candidate.branchGroup === assignment.branchGroup);
+        const thenAssignments = grouped.filter((candidate) => candidate.branchArm === "then");
+        const elseAssignments = grouped.filter((candidate) => candidate.branchArm === "else");
+        if (thenAssignments.length > 0 && elseAssignments.length > 0) {
+          const base = new Map(values);
+          const thenValues = replayMaterialAssignments(thenAssignments, base, call);
+          const elseValues = replayMaterialAssignments(elseAssignments, base, call);
+          const names = /* @__PURE__ */ new Set([
+            ...thenAssignments.flatMap((candidate) => candidate.targets),
+            ...elseAssignments.flatMap((candidate) => candidate.targets)
+          ]);
+          for (const name2 of names) {
+            if (!/^[A-Za-z_]\w*$/.test(name2) || name2 === "_") continue;
+            values.set(name2, (thenValues.get(name2) ?? false) || (elseValues.get(name2) ?? false));
+          }
+          handledBranches.add(assignment.branchGroup);
+          continue;
+        }
+      }
+      const next = /* @__PURE__ */ new Map();
+      assignment.targets.forEach((target, index) => {
+        if (!/^[A-Za-z_]\w*$/.test(target) || target === "_") return;
+        const expression = assignment.expressions[index] ?? (index === 0 ? assignment.expressions[0] : void 0);
+        if (expression === void 0) {
+          next.set(target, false);
+          return;
+        }
+        const executable = maskGoNonCode(expression);
+        const direct = call.start >= assignment.start && call.start < assignment.end && new RegExp(`\\b${escapeRegExp(call.functionText)}\\s*\\(`).test(executable);
+        const derived = [...values].some(([name2, contains]) => contains && new RegExp(`\\b${escapeRegExp(name2)}\\b`).test(executable));
+        next.set(target, direct || derived);
+      });
+      const conditional = !ancestors.includes(assignment.scopeId) && conditionallyExecutedRelativeTo(fn.scopes, assignment.scopeId, insertion.scopeId);
+      for (const [target, contains] of next) {
+        values.set(target, conditional ? (values.get(target) ?? false) || contains : contains);
+      }
+    }
+  }
+  const insertionValue = maskGoNonCode(insertion.value);
+  return [...values].some(([name2, contains]) => contains && new RegExp(`\\b${escapeRegExp(name2)}\\b`).test(insertionValue));
+}
+function replayMaterialAssignments(assignments, base, call) {
+  const values = new Map(base);
+  for (const assignment of assignments.sort((left, right) => left.start - right.start)) {
+    const next = /* @__PURE__ */ new Map();
+    assignment.targets.forEach((target, index) => {
+      if (!/^[A-Za-z_]\w*$/.test(target) || target === "_") return;
+      const expression = assignment.expressions[index] ?? (index === 0 ? assignment.expressions[0] : void 0);
+      if (expression === void 0) {
+        next.set(target, false);
+        return;
+      }
+      const executable = maskGoNonCode(expression);
+      const direct = call.start >= assignment.start && call.start < assignment.end && new RegExp(`\\b${escapeRegExp(call.functionText)}\\s*\\(`).test(executable);
+      const derived = [...values].some(([name2, contains]) => contains && new RegExp(`\\b${escapeRegExp(name2)}\\b`).test(executable));
+      next.set(target, direct || derived);
+    });
+    for (const [target, contains] of next) values.set(target, contains);
+  }
+  return values;
+}
+function isMaterialCall(call, fn) {
+  const receiver = call.functionText.match(/^([A-Za-z_]\w*)\./)?.[1];
+  if (receiver !== void 0 && fn.httpAliases.has(receiver) && /^(?:Get|Post|Head)$/.test(call.name)) return true;
+  if (receiver !== void 0 && fn.fileAliases.has(receiver) && /^(?:Open|ReadFile)$/.test(call.name)) return true;
+  if (/(?:fetch|Fetch|download|Download|retrieve|Retrieve|read|Read|load|Load).*(?:CDN|Cdn|Remote|remote|Bucket|bucket|Storage|storage|File|file|ObjectStore|objectStore)$/.test(call.name)) return true;
+  if (!/^(?:Query|QueryContext|QueryRow|QueryRowContext|Scan)$/.test(call.name)) return false;
+  return receiver !== void 0 && fn.params.some((parameter) => parameter.name === receiver && parameter.sqlDatabase);
+}
+function requestPathTo(target, edges) {
+  const result = [];
+  const pending = [target.id];
+  const seen = new Set(pending);
+  while (pending.length > 0) {
+    const id = pending.shift();
+    for (const edge of edges.filter((candidate) => candidate.callee.id === id)) {
+      result.push(edge);
+      if (!seen.has(edge.caller.id)) {
+        seen.add(edge.caller.id);
+        pending.push(edge.caller.id);
+      }
+    }
+  }
+  return result;
+}
+function hasFiniteAdmission(scopes, keyOrigins, byName, summaries) {
+  return scopes.some(({ fn, beforePosition, seeds }) => {
+    const sourceCode = fn.source.slice(0, Math.max(0, beforePosition - fn.start));
+    const source = maskGoNonCode(sourceCode);
+    for (const admission of fn.admissions.filter((fact) => fact.start < beforePosition)) {
+      const relativeStart = admission.start - fn.start;
+      if (!isDirectGuardForEndpoint(source, relativeStart)) continue;
+      const environment = environmentAt(fn, admission.start, admission.scopeId, seeds, byName, summaries);
+      if (sameRequestOrigin(expressionDependencies(admission.key, environment, byName, summaries), keyOrigins)) return true;
+    }
+    return false;
+  });
+}
+function hasHardCacheBound(fn, insertion, material, finiteConstants, shadowedBuiltins, caches, functions) {
+  if (shadowedBuiltins.has(`${fn.scope}:len`)) return false;
+  const before = maskGoNonCode(fn.source.slice(0, Math.max(0, material.start - fn.start)));
+  for (const guard of fn.capacityGuards.filter((fact) => fact.start < material.start)) {
+    const provenFinite = isPositiveGoInteger(guard.bound) || finiteConstants.has(`${fn.scope}:${guard.bound}`);
+    const relativeStart = guard.start - fn.start;
+    if (provenFinite && isDirectGuardForEndpoint(before, relativeStart) && resolveCacheAt(fn, guard.cache, guard.start, guard.scopeId, caches) === insertion.cacheId && capacityGuardRemainsValid(fn, guard, insertion, material, caches, functions)) {
+      return true;
+    }
+  }
+  return false;
+}
+function capacityGuardRemainsValid(fn, guard, insertion, material, caches, functions) {
+  if (guard.kind === "return") return true;
+  const cacheId = insertion.cacheId;
+  if (cacheId === void 0) return false;
+  if (fn.accesses.some((access) => access.kind === "insert" && access.start > guard.start && access.start < insertion.start && resolveCacheAt(fn, access.cacheText, access.start, access.scopeId, caches) === cacheId)) {
+    return false;
+  }
+  return !fn.calls.some((call) => call.start > guard.end && call.start < insertion.start && call.start !== material.start && callMayMutateCache(fn, call, cacheId, caches, functions));
+}
+function callMayMutateCache(fn, call, cacheId, caches, functions, seen = /* @__PURE__ */ new Set()) {
+  const expressions = [...call.args];
+  const receiver = call.functionText.match(/^([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\./)?.[1];
+  if (receiver !== void 0) expressions.push(receiver);
+  if (expressions.some((expression) => (maskGoNonCode(expression).match(/[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?/g) ?? []).some((candidate) => resolveCacheAt(fn, candidate, call.start, call.scopeId, caches) === cacheId))) return true;
+  if (call.args.length !== 0 || call.functionText !== call.name) return false;
+  const candidates = functions.filter((candidate) => candidate.scope === fn.scope && candidate.name === call.name);
+  if (candidates.length !== 1 || seen.has(candidates[0].id)) return false;
+  const callee = candidates[0];
+  const nextSeen = new Set(seen).add(callee.id);
+  if (callee.accesses.some((access) => access.kind === "insert" && resolveCacheAt(callee, access.cacheText, access.start, access.scopeId, caches) === cacheId)) return true;
+  return callee.calls.some((nested) => callMayMutateCache(callee, nested, cacheId, caches, functions, nextSeen));
+}
+function hasSharedLinearScan(functions, cacheId) {
+  const cacheName = cacheId.startsWith("global:") ? cacheId.split(":").at(-1) : cacheId.split(".").at(-1);
+  const cache = escapeRegExp(cacheName);
+  return functions.some((fn) => new RegExp(`\\.(?:Lock|RLock)\\s*\\(\\)[\\s\\S]{0,500}?for\\s+[^\\n{]*range\\s+(?:[A-Za-z_]\\w*\\.)?${cache}\\b`).test(maskGoNonCode(fn.source)));
+}
+function parseOuterCall(expression) {
+  const match = expression.trim().match(/^(?:[A-Za-z_]\w*\.)*([A-Za-z_]\w*)\s*\(([\s\S]*)\)$/);
+  return match === null ? void 0 : { name: match[1], args: splitTopLevel(match[2]) };
+}
+function splitTopLevel(source) {
+  const parts2 = [];
+  let start2 = 0;
+  let depth = 0;
+  let quoted = "";
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (quoted !== "") {
+      if (character === "\\") index += 1;
+      else if (character === quoted) quoted = "";
+      continue;
+    }
+    if (character === '"' || character === "'" || character === "`") quoted = character;
+    else if ("([{<".includes(character)) depth += 1;
+    else if (")]}>".includes(character)) depth -= 1;
+    else if (character === "," && depth === 0) {
+      parts2.push(source.slice(start2, index).trim());
+      start2 = index + 1;
+    }
+  }
+  const tail = source.slice(start2).trim();
+  if (tail !== "") parts2.push(tail);
+  return parts2;
+}
+function changedLineInRange(files, path, startLine, endLine) {
+  const file = files.find((candidate) => candidate.path === path);
+  if (file === void 0) return void 0;
+  if (file.status === "repository" || file.status === "added") return startLine;
+  for (let line = startLine; line <= endLine; line += 1) {
+    if (!file.changedLines.has(line)) continue;
+    if (file.previous === void 0) return line;
+    const currentLine = (maskGoNonCode(file.current, false).split("\n")[line - 1] ?? "").trimEnd();
+    const previousLine = (maskGoNonCode(file.previous, false).split("\n")[line - 1] ?? "").trimEnd();
+    if (previousLine !== currentLine) return line;
+  }
+  return void 0;
+}
+function lineAt(source, line) {
+  return source.split("\n")[line - 1] ?? "";
+}
+function union(...sets) {
+  return new Set(sets.flatMap((set) => [...set]));
+}
+function sameDependencies(left, right) {
+  return left.size === right.size && [...left].every((item) => right.has(item));
+}
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function deduplicate(signals) {
+  const seen = /* @__PURE__ */ new Set();
+  return signals.filter((signal) => {
+    const key = `${String(signal.data.cacheDeclaration)}:${String(signal.data.insertion)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+function importAliases(source, root, module2, defaultAlias) {
+  const aliases = /* @__PURE__ */ new Set();
+  for (const spec of descendants(root, "import_spec")) {
+    const text = sourceText(spec, source).trim();
+    const match = text.match(new RegExp(`^(?:(\\.|[A-Za-z_]\\w*)\\s+)?"${escapeRegExp(module2)}"$`));
+    if (match !== null) aliases.add(match[1] ?? defaultAlias);
+  }
+  return aliases;
+}
+function isSqlDatabaseType(type, aliases) {
+  const normalized = type.replace(/^\*/, "").replace(/\s+/g, "");
+  const match = normalized.match(/^([A-Za-z_]\w*)\.(?:DB|Tx)$/);
+  return match !== null && aliases.has(match[1]);
+}
+function isHttpRequestType(type, aliases) {
+  const normalized = type.replace(/^\*/, "").replace(/\s+/g, "");
+  if (normalized === "Request") return aliases.has(".");
+  const match = normalized.match(/^([A-Za-z_]\w*)\.Request$/);
+  return match !== null && aliases.has(match[1]);
+}
+function packageScope(path) {
+  const index = path.lastIndexOf("/");
+  return index < 0 ? "." : path.slice(0, index);
+}
+function collectFiniteConstants(file, root, constants, scope) {
+  for (const declaration of descendants(root, "const_declaration")) {
+    if (declaration.parent?.type !== "source_file") continue;
+    for (const spec of descendants(declaration, "const_spec")) {
+      const text = sourceText(spec, file.current);
+      const match = text.match(/^\s*([A-Za-z_]\w*)(?:\s+[A-Za-z_]\w*)?\s*=\s*([0-9][0-9A-Fa-f_xXoObB]*)\s*$/);
+      if (match !== null && isPositiveGoInteger(match[2])) constants.add(`${scope}:${match[1]}`);
+    }
+  }
+}
+function isPositiveGoInteger(value) {
+  try {
+    return BigInt(value.replace(/_/g, "")) > 0n;
+  } catch {
+    return false;
+  }
+}
+function isDirectGuardForEndpoint(source, index) {
+  if (index < 0) return false;
+  return braceDepth(source.slice(0, index)) === braceDepth(source);
+}
+function braceDepth(source) {
+  let depth = 0;
+  for (const character of source) {
+    if (character === "{") depth += 1;
+    else if (character === "}") depth -= 1;
+  }
+  return depth;
+}
+function maskGoNonCode(source, maskStrings = true) {
+  const output = [...source];
+  let state = "code";
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    const next = source[index + 1] ?? "";
+    if (state === "code") {
+      if (character === '"') state = "double";
+      else if (character === "'") state = "single";
+      else if (character === "`") state = "raw";
+      else if (character === "/" && next === "/") state = "line";
+      else if (character === "/" && next === "*") state = "block";
+      else continue;
+    } else if (state === "double" || state === "single") {
+      if (character === "\\") {
+        if (maskStrings) output[index] = " ";
+        index += 1;
+        if (maskStrings && index < output.length && source[index] !== "\n") output[index] = " ";
+        continue;
+      }
+      const closing = state === "double" ? '"' : "'";
+      if (maskStrings) output[index] = character === "\n" ? "\n" : " ";
+      if (character === closing) state = "code";
+      continue;
+    } else if (state === "raw") {
+      if (maskStrings) output[index] = character === "\n" ? "\n" : " ";
+      if (character === "`") state = "code";
+      continue;
+    } else if (state === "line") {
+      if (character === "\n") {
+        state = "code";
+        continue;
+      }
+    } else if (state === "block" && character === "*" && next === "/") {
+      output[index] = " ";
+      output[index + 1] = " ";
+      index += 1;
+      state = "code";
+      continue;
+    }
+    if (character !== "\n" && (maskStrings || state === "line" || state === "block")) output[index] = " ";
+  }
+  return output.join("");
+}
+
 // src/analyze.ts
 async function analyzeDiscovery(discovery) {
   const signals = [];
@@ -21450,6 +23019,14 @@ async function analyzeDiscovery(discovery) {
     } catch (error) {
       parseErrors.push({ path: file.path, message: error instanceof Error ? error.message : String(error) });
     }
+  }
+  try {
+    signals.push(...await requestKeyedCacheSignals(discovery.files));
+  } catch (error) {
+    parseErrors.push({
+      path: "<cross-file request-keyed cache analysis>",
+      message: error instanceof Error ? error.message : String(error)
+    });
   }
   return {
     mode: discovery.mode,
@@ -21584,6 +23161,7 @@ async function discoverSources(ctx) {
     files.push({
       path: source.path,
       current: source.content,
+      ...change.previous === void 0 ? {} : { previous: change.previous },
       changedLines: change.changedLines,
       status: change.status
     });
@@ -21604,7 +23182,8 @@ async function changedSource(ctx, path) {
   if (head !== void 0 && !ctx.change?.worktree) args2.push(head);
   args2.push("--", path);
   const patch = await gitOutput(ctx.repoPath, args2);
-  return { changedLines: changedLineNumbers(patch), status: "modified" };
+  const previous = await gitOutput(ctx.repoPath, ["show", `${base}:${path}`]);
+  return { changedLines: changedLineNumbers(patch), status: "modified", previous };
 }
 async function existsAtRevision(repoPath, revision, path) {
   try {

@@ -1,6 +1,6 @@
 # Third-party notices
 
-The runtime artifact includes `web-tree-sitter` and the `tree-sitter-go` grammar.
+The runtime artifact includes `web-tree-sitter`, the `tree-sitter-go` grammar, and bundled SDK validation dependencies. Full, build-verified license texts for every bundled package and runtime grammar asset are shipped in [`licenses/`](licenses/).
 
 ## web-tree-sitter
 
@@ -49,4 +49,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
