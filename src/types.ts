@@ -1,7 +1,9 @@
 export interface SourceRevision {
   path: string;
   current: string;
+  previous?: string;
   changedLines: Set<number>;
+  deletionAnchors?: Set<number>;
   status: "added" | "modified" | "repository";
 }
 

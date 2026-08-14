@@ -1,5 +1,6 @@
 import { domain } from "./domain.js";
 import { descendants, parseGo, sourceText } from "./parser.js";
+import { requestKeyedCacheSignals } from "./request-cache.js";
 import { type Analysis, type Discovery, type PositiveSignal, type Signal, type SourceRevision } from "./types.js";
 import { type Node } from "web-tree-sitter";
 
@@ -25,6 +26,15 @@ export async function analyzeDiscovery(discovery: Discovery): Promise<Analysis> 
     } catch (error) {
       parseErrors.push({ path: file.path, message: error instanceof Error ? error.message : String(error) });
     }
+  }
+
+  try {
+    signals.push(...await requestKeyedCacheSignals(discovery.files));
+  } catch (error) {
+    parseErrors.push({
+      path: "<cross-file request-keyed cache analysis>",
+      message: error instanceof Error ? error.message : String(error),
+    });
   }
 
   return {

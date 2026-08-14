@@ -86,6 +86,20 @@ export const domain: DomainDefinition = {
       recommendation:
         "Keep opt-in metadata in sidecar storage, or measure and accept the per-entry cost and correct the footprint claim.",
     },
+    {
+      id: "go-perf.request-keyed-cache-amplification",
+      title: "Request-controlled keys can grow an expensive shared cache without bound",
+      category: "performance",
+      severity: "medium",
+      confidence: "medium",
+      summary: (count) =>
+        `${count} request-keyed cache path${count === 1 ? "" : "s"} can amplify misses and retained entries without a cardinality bound.`,
+      whyItMatters:
+        "An attacker can vary a cookie, header, query, or path value to force distinct cache misses, material backend work, and long-lived entries; a TTL limits age, not the number admitted during that window.",
+      impact: "Request volume is amplified into remote/file/database work and memory growth across the process.",
+      recommendation:
+        "Use a cache with a hard entry/weight limit and eviction, or constrain/admit request keys before doing the miss work.",
+    },
   ],
   noRiskSummary:
     "No material defer-in-loop, per-request client, repeated compilation, or quadratic string building was found.",

@@ -2,7 +2,7 @@
 
 Go Performance reviews material allocation, copying, retention, buffering, and contention risk with evidence rather than micro-optimization style advice.
 
-The initial review focuses on invariant regular-expression compilation in loops, redundant byte/string copies in loops, and unbounded process-lifetime maps.
+The review focuses on invariant regular-expression compilation in loops, redundant byte/string copies, and request-controlled expensive caches without cardinality bounds.
 
 ## Fixtures and calibration
 
