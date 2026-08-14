@@ -870,10 +870,16 @@ function localFunctionLiteralDefinitelyInvoked(literal: Node): boolean {
   for (const statement of laterStatements) {
     if (declarationAssignsName(statement, name)) return false;
     const call = directInvocationStatement(statement);
-    if (call?.childForFieldName("function")?.type === "identifier" &&
-      call.childForFieldName("function")!.text === name) return true;
+    const invoked = unwrapParenthesized(call?.childForFieldName("function") ?? null);
+    if (invoked?.type === "identifier" && invoked.text === name) return true;
   }
   return false;
+}
+
+function unwrapParenthesized(node: Node | null): Node | null {
+  let current = node;
+  while (current?.type === "parenthesized_expression") current = current.namedChildren[0] ?? null;
+  return current;
 }
 
 function assignedSingleIdentifier(declaration: Node): string | undefined {
@@ -1751,19 +1757,40 @@ function isMaterialCall(
   byName: Map<string, FunctionFact>,
   seen = new Set<string>(),
 ): boolean {
+  if (isDirectMaterialCall(call, fn)) return true;
+  if (!materialNameSuggestsBackend(call.name)) return false;
+  const callee = byName.get(call.name);
+  if (callee === undefined) return true;
+  return functionPerformsMaterialWork(callee, byName, new Set(seen).add(callee.id));
+}
+
+function functionPerformsMaterialWork(
+  fn: FunctionFact,
+  byName: Map<string, FunctionFact>,
+  seen: Set<string>,
+): boolean {
+  return fn.calls.some((call) => {
+    if (isDirectMaterialCall(call, fn)) return true;
+    const callee = byName.get(call.name);
+    if (callee !== undefined) {
+      if (seen.has(callee.id)) return false;
+      return functionPerformsMaterialWork(callee, byName, new Set(seen).add(callee.id));
+    }
+    return materialNameSuggestsBackend(call.name);
+  });
+}
+
+function isDirectMaterialCall(call: Call, fn: FunctionFact): boolean {
   const receiver = call.functionText.match(/^([A-Za-z_]\w*)\./)?.[1];
   if (receiver !== undefined && fn.httpAliases.has(receiver) && /^(?:Get|Post|Head)$/.test(call.name)) return true;
   if (receiver !== undefined && fn.fileAliases.has(receiver) && /^(?:Open|ReadFile)$/.test(call.name)) return true;
-  if (/(?:fetch|Fetch|download|Download|retrieve|Retrieve|read|Read|load|Load).*(?:CDN|Cdn|Remote|remote|Bucket|bucket|Storage|storage|File|file|ObjectStore|objectStore)$/.test(call.name)) {
-    const callee = byName.get(call.name);
-    if (callee === undefined) return true;
-    if (seen.has(callee.id)) return false;
-    const nextSeen = new Set(seen).add(callee.id);
-    return callee.calls.some((nested) => isMaterialCall(nested, callee, byName, nextSeen));
-  }
   if (!/^(?:Query|QueryContext|QueryRow|QueryRowContext|Scan)$/.test(call.name)) return false;
   return receiver !== undefined && fn.params.some((parameter) =>
     parameter.name === receiver && parameter.sqlDatabase);
+}
+
+function materialNameSuggestsBackend(name: string): boolean {
+  return /(?:fetch|Fetch|download|Download|retrieve|Retrieve|read|Read|load|Load).*(?:CDN|Cdn|Remote|remote|Bucket|bucket|Storage|storage|File|file|ObjectStore|objectStore)$/.test(name);
 }
 
 function requestPathTo(target: FunctionFact, edges: CallEdge[]): CallEdge[] {

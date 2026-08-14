@@ -1045,6 +1045,7 @@ test("analyzes stored closures only when a direct invocation is proven", async (
   %INVOKE%`;
   for (const [name, invocation, expected] of [
     ["direct", "work()", true],
+    ["parenthesized", "((work))()", true],
     ["go", "go work()", true],
     ["defer", "defer work()", true],
     ["uninvoked", "_ = work", false],
@@ -1215,6 +1216,37 @@ func handle(req *http.Request) {
 }`;
   const analysis = await analyzeDiscovery({ mode: "repository", files: [revision("local-helper.go", source, "repository")] });
   assert.equal(analysis.signals.some((item) => item.ruleId === ruleId), false);
+
+  const transitive = `package p
+import (
+  "net/http"
+  "os"
+)
+var cache = map[string][]byte{}
+func helper(key string) []byte { value, _ := os.ReadFile(key); return value }
+func fetchRemoteFile(key string) []byte { return helper(key) }
+func handle(req *http.Request) {
+  key := req.Header.Get("X-Tenant")
+  if _, ok := cache[key]; ok { return }
+  value := fetchRemoteFile(key)
+  cache[key] = value
+}`;
+  const transitiveAnalysis = await analyzeDiscovery({
+    mode: "repository",
+    files: [revision("transitive-helper.go", transitive, "repository")],
+  });
+  assert.equal(transitiveAnalysis.signals.some((item) => item.ruleId === ruleId), true);
+
+  const cycle = source
+    .replace("func readCachedFile(key string) []byte { return embeddedFiles[key] }", [
+      "func readCachedFile(key string) []byte { return helper(key) }",
+      "func helper(key string) []byte { return readCachedFile(key) }",
+    ].join("\n"));
+  const cycleAnalysis = await analyzeDiscovery({
+    mode: "repository",
+    files: [revision("cyclic-helper.go", cycle, "repository")],
+  });
+  assert.equal(cycleAnalysis.signals.some((item) => item.ruleId === ruleId), false);
 });
 
 function baseHeaderCase(body: string, includeLookup = true): string {
