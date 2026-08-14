@@ -41,6 +41,7 @@ export async function discoverSources(ctx: RuleContext): Promise<Discovery> {
       current: source.content,
       ...(change.previous === undefined ? {} : { previous: change.previous }),
       changedLines: change.changedLines,
+      ...(change.deletionAnchors === undefined ? {} : { deletionAnchors: change.deletionAnchors }),
       status: change.status,
     });
   }
@@ -55,7 +56,7 @@ export async function discoverSources(ctx: RuleContext): Promise<Discovery> {
 async function changedSource(
   ctx: RuleContext,
   path: string,
-): Promise<Pick<SourceRevision, "changedLines" | "status" | "previous">> {
+): Promise<Pick<SourceRevision, "changedLines" | "status" | "previous" | "deletionAnchors">> {
   const base = ctx.change?.baseRef;
   if (base === undefined || !(await existsAtRevision(ctx.repoPath, base, path))) {
     return { changedLines: new Set<number>(), status: "added" };
@@ -67,7 +68,8 @@ async function changedSource(
   args.push("--", path);
   const patch = await gitOutput(ctx.repoPath, args);
   const previous = await gitOutput(ctx.repoPath, ["show", `${base}:${path}`]);
-  return { changedLines: changedLineNumbers(patch), status: "modified", previous };
+  const deletionAnchors = deletionAnchorLines(patch);
+  return { changedLines: changedLineNumbers(patch), deletionAnchors, status: "modified", previous };
 }
 
 async function existsAtRevision(repoPath: string, revision: string, path: string): Promise<boolean> {
@@ -94,7 +96,20 @@ function changedLineNumbers(patch: string): Set<number> {
   for (const match of patch.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm)) {
     const start = Number(match[1]);
     const count = match[2] === undefined ? 1 : Number(match[2]);
+    // A deletion-only hunk has no added line, but it can remove the sole guard
+    // that made a surviving operation safe. Keep the first surviving line as
+    // semantic locality; previous-state fingerprints still suppress unrelated
+    // deletions around an already-existing finding.
+    if (count === 0) lines.add(Math.max(1, start));
     for (let line = start; line < start + count; line += 1) lines.add(line);
+  }
+  return lines;
+}
+
+function deletionAnchorLines(patch: string): Set<number> {
+  const lines = new Set<number>();
+  for (const match of patch.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+),0 @@/gm)) {
+    lines.add(Math.max(1, Number(match[1])));
   }
   return lines;
 }

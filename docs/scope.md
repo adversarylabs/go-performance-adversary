@@ -8,7 +8,7 @@ Source of truth for what this adversary is *for*.
 
 ## Mission
 
-Review Go for hot-path performance defects and resource amplification (defer-in-loop, per-request clients, regexp compile, quadratic strings, and expensive shared caches keyed by request-controlled values).
+Review Go for hot-path performance defects and resource amplification (defer-in-loop, per-request clients, regexp compile, quadratic strings, and expensive shared caches keyed by request-controlled values). Request-local receivers and callbacks not proven to execute stay out of the shared-cache signal.
 
 ## In scope (fair miss if humans raised it and we did not)
 

@@ -12,6 +12,7 @@ import { createApp } from "../src/index.ts";
 
 const execute = promisify(execFile);
 const ruleId = "go-perf.cache-element-footprint-claim";
+const requestCacheRuleId = "go-perf.request-keyed-cache-amplification";
 
 test("an unrelated edit does not surface a legacy cache footprint claim", async () => {
   const repo = await repositoryWithLegacyClaim();
@@ -44,6 +45,29 @@ test("an added Go file remains eligible in full", async () => {
   assert.equal(review.findings.filter((finding) => finding.ruleId === ruleId).length, 1);
 });
 
+test("deleting the sole hard bound anchors the newly unsafe surviving miss path", async () => {
+  const repo = await mkdtemp(join(tmpdir(), "go-performance-deleted-bound-"));
+  await execute("git", ["init", "--quiet"], { cwd: repo });
+  await execute("git", ["config", "user.email", "tests@example.com"], { cwd: repo });
+  await execute("git", ["config", "user.name", "Tests"], { cwd: repo });
+  const path = "cache.go";
+  const bounded = requestCacheSource(true);
+  await writeFile(join(repo, path), bounded);
+  await execute("git", ["add", path], { cwd: repo });
+  await execute("git", ["commit", "--quiet", "-m", "bounded fixture"], { cwd: repo });
+  const unbounded = requestCacheSource(false);
+  await writeFile(join(repo, path), unbounded);
+
+  const discovery = await discoverSources(changedContext(repo, [path]));
+  const survivingAnchorLine = unbounded.split("\n").findIndex((line) => line.includes("cache[key]; ok")) + 1;
+  assert.deepEqual([...discovery.files[0]!.changedLines], [survivingAnchorLine]);
+  assert.deepEqual([...discovery.files[0]!.deletionAnchors!], [survivingAnchorLine]);
+  const analysis = await analyzeDiscovery(discovery);
+  const signal = analysis.signals.find((item) => item.ruleId === requestCacheRuleId);
+  assert.equal(signal?.line, survivingAnchorLine);
+  assert.equal(signal?.data.anchor, "cache lookup");
+});
+
 async function repositoryWithLegacyClaim(): Promise<string> {
   const repo = await mkdtemp(join(tmpdir(), "go-performance-discover-"));
   await execute("git", ["init", "--quiet"], { cwd: repo });
@@ -63,6 +87,26 @@ type Cache struct { Entries []Entry }
 // The cache footprint stays unchanged.
 func build() {
 	println(${JSON.stringify(diagnostic)})
+}
+`;
+}
+
+function requestCacheSource(bounded: boolean): string {
+  return `package fixture
+
+import (
+	"net/http"
+	"os"
+)
+
+const maxEntries = 64
+var cache = map[string][]byte{}
+
+func handle(req *http.Request) {
+	key := req.Header.Get("X-Tenant")
+	if _, ok := cache[key]; ok { return }
+${bounded ? "\tif len(cache) >= maxEntries { return }\n" : ""}	value, _ := os.ReadFile(key)
+	cache[key] = value
 }
 `;
 }

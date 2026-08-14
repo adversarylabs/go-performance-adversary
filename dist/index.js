@@ -21508,6 +21508,7 @@ async function currentRequestKeyedCacheSignals(files) {
       const material = findMaterialWork(fn, insertion, lookup, keyDependencies, seeds, byName, returnDependencies);
       if (material === void 0) continue;
       const requestPath = requestPathTo(fn, callEdges);
+      if (receiverCacheIsProvenRequestLocal(fn, insertion.cacheId, requestPath)) continue;
       const localAdmission = hasFiniteAdmission([{
         fn,
         beforePosition: material.start,
@@ -21708,6 +21709,8 @@ function functionFact(file, node, caches, receiverMapFields, httpAliases, sqlAli
     };
   });
   const receiverCaches = /* @__PURE__ */ new Map();
+  let receiverVariable;
+  let receiverTypeName;
   const receiver = node.childForFieldName("receiver");
   if (receiver !== null) {
     const declaration = descendants(receiver, "parameter_declaration")[0];
@@ -21716,6 +21719,8 @@ function functionFact(file, node, caches, receiverMapFields, httpAliases, sqlAli
     if (receiverName !== null && receiverName !== void 0 && receiverType !== null && receiverType !== void 0) {
       const variable = sourceText(receiverName, file.current);
       const typeName = sourceText(receiverType, file.current).replace(/^\*/, "");
+      receiverVariable = variable;
+      receiverTypeName = typeName;
       const receiverId = `${scope}:${typeName}`;
       for (const field of receiverMapFields.get(receiverId) ?? []) {
         receiverCaches.set(`${variable}.${field}`, `field:${receiverId}.${field}`);
@@ -21776,7 +21781,9 @@ function functionFact(file, node, caches, receiverMapFields, httpAliases, sqlAli
     scope,
     scopes,
     rootScopeId,
-    receiverCaches
+    receiverCaches,
+    ...receiverVariable === void 0 ? {} : { receiverName: receiverVariable },
+    ...receiverTypeName === void 0 ? {} : { receiverType: receiverTypeName }
   };
 }
 function parameters(node, source, httpAliases, sqlAliases) {
@@ -21955,7 +21962,7 @@ function assignmentFact(source, node, scopeId) {
     ].includes(node.parent.type) ? node.parent.endIndex : Number.POSITIVE_INFINITY,
     scopeId,
     declaration: operator === ":=",
-    terminatesBranch: enclosingTerminatingBranch(node),
+    terminatesBranch: enclosingTerminatingBranch(node, source),
     ...enclosingIfArm(node)
   };
 }
@@ -21972,7 +21979,7 @@ function variableFact(source, node, scopeId) {
     visibilityEnd: Number.POSITIVE_INFINITY,
     scopeId,
     declaration: true,
-    terminatesBranch: enclosingTerminatingBranch(node),
+    terminatesBranch: enclosingTerminatingBranch(node, source),
     ...enclosingIfArm(node)
   };
 }
@@ -21995,14 +22002,14 @@ function enclosingIfArm(node) {
   }
   return {};
 }
-function enclosingTerminatingBranch(node) {
+function enclosingTerminatingBranch(node, source) {
   let current = node.parent;
   while (current !== null && current.type !== "function_declaration" && current.type !== "method_declaration" && current.type !== "func_literal") {
     if (current.type === "block") {
       if (current.parent !== null && ["function_declaration", "method_declaration", "func_literal"].includes(current.parent.type)) {
         return false;
       }
-      if (blockTerminates(current)) return true;
+      if (blockTerminates(current, source)) return true;
     }
     current = current.parent;
   }
@@ -22025,12 +22032,12 @@ function callFact(source, node, scopeId) {
     text: sourceText(node, source).trim(),
     start: node.startIndex,
     scopeId,
-    executable: nodeIsReachable(node) && !insideUninvokedFunctionLiteral(node),
+    executable: nodeIsReachable(node, source) && !insideUninvokedFunctionLiteral(node, source),
     hitEscape: guard?.kind === "hit",
     ...guard?.kind === "miss" ? { missBranch: guard.branch } : {}
   };
 }
-function insideUninvokedFunctionLiteral(node) {
+function insideUninvokedFunctionLiteral(node, source) {
   let current = node.parent;
   while (current !== null && !["function_declaration", "method_declaration"].includes(current.type)) {
     if (current.type === "func_literal") {
@@ -22038,13 +22045,34 @@ function insideUninvokedFunctionLiteral(node) {
       while (wrapper.parent !== null && wrapper.parent.type === "parenthesized_expression") wrapper = wrapper.parent;
       const parent = wrapper.parent;
       const directlyInvoked = parent?.type === "call_expression" && parent.childForFieldName("function")?.id === wrapper.id;
-      const passedToCall = parent?.type === "argument_list" && parent.parent?.type === "call_expression";
+      const passedToKnownExecutingCall = parent?.type === "argument_list" && parent.parent?.type === "call_expression" && callbackIsSynchronouslyExecuted(parent.parent, wrapper, source);
       const assignedAndInvoked = localFunctionLiteralDefinitelyInvoked(current);
-      if (!directlyInvoked && !passedToCall && !assignedAndInvoked) return true;
+      if (!directlyInvoked && !passedToKnownExecutingCall && !assignedAndInvoked) return true;
     }
     current = current.parent;
   }
   return false;
+}
+function callbackIsSynchronouslyExecuted(call, literal, source) {
+  const fn = call.childForFieldName("function")?.text.replace(/\s+/g, "") ?? "";
+  const args2 = call.childForFieldName("arguments")?.namedChildren ?? [];
+  if (args2.at(-1)?.id !== literal.id) return false;
+  const selected = fn.match(/^([A-Za-z_]\w*)\.(?:Do|DoChan)$/)?.[1];
+  if (selected === void 0) return false;
+  let root = call;
+  while (root.parent !== null) root = root.parent;
+  const aliases = importAliases(source, root, "golang.org/x/sync/singleflight", "singleflight");
+  if (aliases.size === 0) return false;
+  return descendants(root, "var_spec").some((spec) => {
+    let owner = spec.parent;
+    while (owner !== null && owner.type !== "source_file" && !["function_declaration", "method_declaration", "func_literal"].includes(owner.type)) owner = owner.parent;
+    if (owner?.type !== "source_file") return false;
+    if (!declaredNames(spec, source).includes(selected)) return false;
+    const compact = sourceText(spec, source).replace(/\s+/g, "");
+    return [...aliases].some((alias) => new RegExp(
+      `^${escapeRegExp(selected)}(?:\\*?${escapeRegExp(alias)}\\.Group|=(?:&)?${escapeRegExp(alias)}\\.Group\\{)`
+    ).test(compact));
+  });
 }
 function localFunctionLiteralDefinitelyInvoked(literal) {
   let assignment = literal.parent;
@@ -22085,24 +22113,31 @@ function directInvocationStatement(statement) {
   }
   return candidate.type === "call_expression" ? candidate : void 0;
 }
-function nodeIsReachable(node) {
+function nodeIsReachable(node, source) {
   let current = node;
   while (current?.parent !== null && current?.parent !== void 0) {
     const parent = current.parent;
     if (parent.type === "statement_list") {
       const index = parent.namedChildren.findIndex((candidate) => candidate.id === current.id);
-      if (index >= 0 && parent.namedChildren.slice(0, index).some(statementAlwaysTerminates)) return false;
+      if (index >= 0 && parent.namedChildren.slice(0, index).some((item) => statementAlwaysTerminates(item, source))) {
+        return false;
+      }
     }
     current = parent;
   }
   return true;
 }
-function statementAlwaysTerminates(node) {
+function statementAlwaysTerminates(node, source) {
   if (["return_statement", "break_statement", "continue_statement", "goto_statement"].includes(node.type)) return true;
+  if (node.type === "expression_statement") {
+    const call = node.namedChildren[0];
+    const fn = call?.type === "call_expression" ? call.childForFieldName("function") : null;
+    if (fn?.type === "identifier" && sourceText(fn, source) === "panic" && !identifierShadowedAt(node, "panic", source)) return true;
+  }
   if (node.type !== "if_statement") return false;
   const consequence = node.childForFieldName("consequence");
   const alternative = node.childForFieldName("alternative");
-  return consequence !== null && alternative !== null && blockTerminates(consequence) && (alternative.type === "if_statement" ? statementAlwaysTerminates(alternative) : blockTerminates(alternative));
+  return consequence !== null && alternative !== null && blockTerminates(consequence, source) && (alternative.type === "if_statement" ? statementAlwaysTerminates(alternative, source) : blockTerminates(alternative, source));
 }
 function commaOkGuard(value, source) {
   let assignment = value.parent;
@@ -22131,16 +22166,16 @@ function commaOkGuard(value, source) {
   const consequence = guard.childForFieldName("consequence");
   if (condition === null || consequence === null) return void 0;
   const compact = sourceText(condition, source).replace(/\s+/g, "").replace(/^\((.*)\)$/, "$1");
-  if (compact === ok && blockTerminates(consequence)) return { kind: "hit" };
+  if (compact === ok && blockTerminates(consequence, source)) return { kind: "hit" };
   if (compact === `!${ok}`) {
     return { kind: "miss", branch: { start: consequence.startIndex, end: consequence.endIndex } };
   }
   return void 0;
 }
-function blockTerminates(block) {
+function blockTerminates(block, source) {
   const statements = block.namedChildren.find((node) => node.type === "statement_list")?.namedChildren ?? [];
   const final = statements.at(-1);
-  return final !== void 0 && ["return_statement", "continue_statement"].includes(final.type);
+  return final !== void 0 && statementAlwaysTerminates(final, source);
 }
 function fixedAdmissions(source, body2, scopes) {
   const result = [];
@@ -22178,7 +22213,7 @@ function capacityGuardFacts(source, body2, scopes) {
     if (identifierShadowedAt(statement, "len", source)) continue;
     const match = sourceText(condition, source).replace(/\s+/g, "").match(/^len\(([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\)(?:>=|>)([0-9][0-9A-Fa-f_xXoObB]*|[A-Za-z_]\w*)$/);
     if (match === null) continue;
-    const returns = blockTerminates(consequence);
+    const returns = blockTerminates(consequence, source);
     const evicts = evictsRangedEntry(consequence, source, match[1]);
     if (!returns && !evicts) continue;
     result.push({
@@ -22187,12 +22222,27 @@ function capacityGuardFacts(source, body2, scopes) {
       start: statement.startIndex,
       end: statement.endIndex,
       scopeId: scopeForNode(statement, scopes).id,
-      kind: returns ? "return" : "ranged-eviction"
+      kind: returns ? "return" : "ranged-eviction",
+      boundLocallyShadowed: /^[A-Za-z_]\w*$/.test(match[2]) && locallyShadowedAt(statement, match[2], source)
     });
   }
   return result;
 }
 function identifierShadowedAt(reference, name2, source) {
+  if (locallyShadowedAt(reference, name2, source)) return true;
+  let root = reference;
+  while (root.parent !== null) root = root.parent;
+  return [
+    ...descendants(root, "var_spec"),
+    ...descendants(root, "const_spec"),
+    ...descendants(root, "function_declaration"),
+    ...descendants(root, "type_spec")
+  ].some((declaration) => {
+    if (declaration.type !== "function_declaration" && declaration.parent?.parent?.type !== "source_file" && declaration.parent?.type !== "source_file") return false;
+    return declaredNames(declaration, source).includes(name2);
+  });
+}
+function locallyShadowedAt(reference, name2, source) {
   let callable = reference;
   while (callable !== null && !["function_declaration", "method_declaration", "func_literal"].includes(callable.type)) {
     callable = callable.parent;
@@ -22205,6 +22255,7 @@ function identifierShadowedAt(reference, name2, source) {
       const declarations = [
         ...descendants(body2, "short_var_declaration"),
         ...descendants(body2, "var_spec"),
+        ...descendants(body2, "const_spec"),
         ...descendants(body2, "range_clause"),
         ...descendants(body2, "receive_statement"),
         ...descendants(body2, "type_switch_statement")
@@ -22212,17 +22263,7 @@ function identifierShadowedAt(reference, name2, source) {
       if (declarations.some((declaration) => declaration.startIndex < reference.startIndex && declarationVisibleAt(declaration, reference) && declaredNames(declaration, source).includes(name2))) return true;
     }
   }
-  let root = reference;
-  while (root.parent !== null) root = root.parent;
-  return [
-    ...descendants(root, "var_spec"),
-    ...descendants(root, "const_spec"),
-    ...descendants(root, "function_declaration"),
-    ...descendants(root, "type_spec")
-  ].some((declaration) => {
-    if (declaration.type !== "function_declaration" && declaration.parent?.parent?.type !== "source_file" && declaration.parent?.type !== "source_file") return false;
-    return declaredNames(declaration, source).includes(name2);
-  });
+  return false;
 }
 function declaredNames(declaration, source) {
   if (declaration.type === "function_declaration" || declaration.type === "type_spec") {
@@ -22284,7 +22325,7 @@ function evictsRangedEntry(consequence, source, cache) {
 function cacheAccesses(source, body2, scopes) {
   const insertions = /* @__PURE__ */ new Map();
   for (const assignment of descendants(body2, "assignment_statement")) {
-    if (!nodeIsReachable(assignment) || insideUninvokedFunctionLiteral(assignment)) continue;
+    if (!nodeIsReachable(assignment, source) || insideUninvokedFunctionLiteral(assignment, source)) continue;
     const text = sourceText(assignment, source);
     const left = text.slice(0, text.indexOf("="));
     for (const match of left.matchAll(/([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\s*\[([^\]]+)\]/g)) {
@@ -22307,7 +22348,7 @@ function cacheAccesses(source, body2, scopes) {
   }
   const accesses = [...insertions.values()];
   for (const index of descendants(body2, "index_expression")) {
-    if (!nodeIsReachable(index) || insideUninvokedFunctionLiteral(index)) continue;
+    if (!nodeIsReachable(index, source) || insideUninvokedFunctionLiteral(index, source)) continue;
     const text = sourceText(index, source);
     const match = text.match(/^\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\s*\[([\s\S]+)\]\s*$/);
     if (match === null) continue;
@@ -22677,7 +22718,7 @@ function findCacheLookup(fn, insertion, keyOrigins, seeds, summaries, byName, re
 }
 function findMaterialWork(fn, insertion, lookup, keyOrigins, seeds, byName, summaries) {
   return fn.calls.find((call) => {
-    if (call.start <= lookup.start || call.start >= insertion.end || !isMaterialCall(call, fn)) return false;
+    if (call.start <= lookup.start || call.start >= insertion.end || !isMaterialCall(call, fn, byName)) return false;
     const env = environmentAt(fn, call.start, call.scopeId, seeds, byName, summaries);
     return materialFeedsInsertion(fn, call, insertion) && call.args.some((argument) => sameRequestOrigin(expressionDependencies(argument, env, byName, summaries), keyOrigins));
   });
@@ -22761,11 +22802,17 @@ function replayMaterialAssignments(assignments, base, call) {
   }
   return values;
 }
-function isMaterialCall(call, fn) {
+function isMaterialCall(call, fn, byName, seen = /* @__PURE__ */ new Set()) {
   const receiver = call.functionText.match(/^([A-Za-z_]\w*)\./)?.[1];
   if (receiver !== void 0 && fn.httpAliases.has(receiver) && /^(?:Get|Post|Head)$/.test(call.name)) return true;
   if (receiver !== void 0 && fn.fileAliases.has(receiver) && /^(?:Open|ReadFile)$/.test(call.name)) return true;
-  if (/(?:fetch|Fetch|download|Download|retrieve|Retrieve|read|Read|load|Load).*(?:CDN|Cdn|Remote|remote|Bucket|bucket|Storage|storage|File|file|ObjectStore|objectStore)$/.test(call.name)) return true;
+  if (/(?:fetch|Fetch|download|Download|retrieve|Retrieve|read|Read|load|Load).*(?:CDN|Cdn|Remote|remote|Bucket|bucket|Storage|storage|File|file|ObjectStore|objectStore)$/.test(call.name)) {
+    const callee = byName.get(call.name);
+    if (callee === void 0) return true;
+    if (seen.has(callee.id)) return false;
+    const nextSeen = new Set(seen).add(callee.id);
+    return callee.calls.some((nested) => isMaterialCall(nested, callee, byName, nextSeen));
+  }
   if (!/^(?:Query|QueryContext|QueryRow|QueryRowContext|Scan)$/.test(call.name)) return false;
   return receiver !== void 0 && fn.params.some((parameter) => parameter.name === receiver && parameter.sqlDatabase);
 }
@@ -22784,6 +22831,26 @@ function requestPathTo(target, edges) {
     }
   }
   return result;
+}
+function receiverCacheIsProvenRequestLocal(fn, cacheId, requestPath) {
+  if (!cacheId.startsWith("field:") || fn.receiverName === void 0 || fn.receiverType === void 0) return false;
+  const receiverType = fn.receiverType;
+  const incoming = requestPath.filter((edge) => edge.callee.id === fn.id);
+  if (incoming.length === 0) return false;
+  return incoming.every((edge) => {
+    const receiver = edge.call.functionText.match(/^([A-Za-z_]\w*)\.[A-Za-z_]\w*$/)?.[1];
+    if (receiver === void 0) return false;
+    const ancestors = scopeAncestors(edge.caller.scopes, edge.scopeId);
+    const assignments = edge.caller.assignments.filter((assignment) => assignment.start < edge.start && edge.start <= assignment.visibilityEnd && assignment.targets.includes(receiver) && (ancestors.includes(assignment.scopeId) || !assignment.declaration && callableScope(edge.caller.scopes, assignment.scopeId) === callableScope(edge.caller.scopes, edge.scopeId)));
+    const latest = assignments.at(-1);
+    if (latest === void 0 || !latest.declaration) return false;
+    const index = latest.targets.indexOf(receiver);
+    const value = latest.expressions[index] ?? (index === 0 ? latest.expressions[0] : void 0);
+    if (value === void 0) return false;
+    const compact = value.replace(/\s+/g, "");
+    const type = escapeRegExp(receiverType);
+    return new RegExp(`^(?:&?${type}\\{|new\\(${type}\\))`).test(compact);
+  });
 }
 function hasFiniteAdmission(scopes, keyOrigins, byName, summaries) {
   return scopes.some(({ fn, beforePosition, seeds }) => {
@@ -22804,7 +22871,7 @@ function hasHardCacheBound(fn, insertion, material, finiteConstants, shadowedBui
   for (const guard of fn.capacityGuards.filter((fact) => fact.start < material.start)) {
     const provenFinite = isPositiveGoInteger(guard.bound) || finiteConstants.has(`${fn.scope}:${guard.bound}`);
     const relativeStart = guard.start - fn.start;
-    if (provenFinite && isDirectGuardForEndpoint(before, relativeStart) && resolveCacheAt(fn, guard.cache, guard.start, guard.scopeId, caches) === insertion.cacheId && capacityGuardRemainsValid(fn, guard, insertion, material, caches, functions)) {
+    if (provenFinite && !guard.boundLocallyShadowed && isDirectGuardForEndpoint(before, relativeStart) && resolveCacheAt(fn, guard.cache, guard.start, guard.scopeId, caches) === insertion.cacheId && capacityGuardRemainsValid(fn, guard, insertion, material, caches, functions)) {
       return true;
     }
   }
@@ -22871,6 +22938,7 @@ function changedLineInRange(files, path, startLine, endLine) {
   if (file.status === "repository" || file.status === "added") return startLine;
   for (let line = startLine; line <= endLine; line += 1) {
     if (!file.changedLines.has(line)) continue;
+    if (file.deletionAnchors?.has(line)) return line;
     if (file.previous === void 0) return line;
     const currentLine = (maskGoNonCode(file.current, false).split("\n")[line - 1] ?? "").trimEnd();
     const previousLine = (maskGoNonCode(file.previous, false).split("\n")[line - 1] ?? "").trimEnd();
@@ -23163,6 +23231,7 @@ async function discoverSources(ctx) {
       current: source.content,
       ...change.previous === void 0 ? {} : { previous: change.previous },
       changedLines: change.changedLines,
+      ...change.deletionAnchors === void 0 ? {} : { deletionAnchors: change.deletionAnchors },
       status: change.status
     });
   }
@@ -23183,7 +23252,8 @@ async function changedSource(ctx, path) {
   args2.push("--", path);
   const patch = await gitOutput(ctx.repoPath, args2);
   const previous = await gitOutput(ctx.repoPath, ["show", `${base}:${path}`]);
-  return { changedLines: changedLineNumbers(patch), status: "modified", previous };
+  const deletionAnchors = deletionAnchorLines(patch);
+  return { changedLines: changedLineNumbers(patch), deletionAnchors, status: "modified", previous };
 }
 async function existsAtRevision(repoPath, revision, path) {
   try {
@@ -23207,7 +23277,15 @@ function changedLineNumbers(patch) {
   for (const match of patch.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm)) {
     const start2 = Number(match[1]);
     const count = match[2] === void 0 ? 1 : Number(match[2]);
+    if (count === 0) lines.add(Math.max(1, start2));
     for (let line = start2; line < start2 + count; line += 1) lines.add(line);
+  }
+  return lines;
+}
+function deletionAnchorLines(patch) {
+  const lines = /* @__PURE__ */ new Set();
+  for (const match of patch.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+),0 @@/gm)) {
+    lines.add(Math.max(1, Number(match[1])));
   }
   return lines;
 }
@@ -23350,7 +23428,7 @@ function addPositives(ctx, analysis) {
 function createApp() {
   const app = new Adversary({
     name: domain.name,
-    version: "0.0.7",
+    version: "0.0.8",
     review: { maximumFindings: 8, minimumConfidence: "medium" }
   });
   app.rule(`${domain.name}.review`, async (ctx) => {

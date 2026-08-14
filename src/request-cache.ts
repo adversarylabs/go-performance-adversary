@@ -92,6 +92,7 @@ interface CapacityGuardFact {
   end: number;
   scopeId: string;
   kind: "return" | "ranged-eviction";
+  boundLocallyShadowed: boolean;
 }
 
 interface FunctionFact {
@@ -116,6 +117,8 @@ interface FunctionFact {
   scopes: Map<string, LexicalScope>;
   rootScopeId: string;
   receiverCaches: Map<string, string>;
+  receiverName?: string;
+  receiverType?: string;
 }
 
 interface PersistentCache {
@@ -192,6 +195,7 @@ async function currentRequestKeyedCacheSignals(files: SourceRevision[]): Promise
       if (material === undefined) continue;
 
       const requestPath = requestPathTo(fn, callEdges);
+      if (receiverCacheIsProvenRequestLocal(fn, insertion.cacheId, requestPath)) continue;
       const localAdmission = hasFiniteAdmission([{
         fn,
         beforePosition: material.start,
@@ -430,6 +434,8 @@ function functionFact(
     };
   });
   const receiverCaches = new Map<string, string>();
+  let receiverVariable: string | undefined;
+  let receiverTypeName: string | undefined;
   const receiver = node.childForFieldName("receiver");
   if (receiver !== null) {
     const declaration = descendants(receiver, "parameter_declaration")[0];
@@ -438,6 +444,8 @@ function functionFact(
     if (receiverName !== null && receiverName !== undefined && receiverType !== null && receiverType !== undefined) {
       const variable = sourceText(receiverName, file.current);
       const typeName = sourceText(receiverType, file.current).replace(/^\*/, "");
+      receiverVariable = variable;
+      receiverTypeName = typeName;
       const receiverId = `${scope}:${typeName}`;
       for (const field of receiverMapFields.get(receiverId) ?? []) {
         receiverCaches.set(`${variable}.${field}`, `field:${receiverId}.${field}`);
@@ -506,6 +514,8 @@ function functionFact(
     scopes,
     rootScopeId,
     receiverCaches,
+    ...(receiverVariable === undefined ? {} : { receiverName: receiverVariable }),
+    ...(receiverTypeName === undefined ? {} : { receiverType: receiverTypeName }),
   };
 }
 
@@ -716,7 +726,7 @@ function assignmentFact(source: string, node: Node, scopeId: string): Assignment
     ].includes(node.parent.type) ? node.parent.endIndex : Number.POSITIVE_INFINITY,
     scopeId,
     declaration: operator === ":=",
-    terminatesBranch: enclosingTerminatingBranch(node),
+    terminatesBranch: enclosingTerminatingBranch(node, source),
     ...enclosingIfArm(node),
   };
 }
@@ -736,7 +746,7 @@ function variableFact(source: string, node: Node, scopeId: string): Assignment |
     visibilityEnd: Number.POSITIVE_INFINITY,
     scopeId,
     declaration: true,
-    terminatesBranch: enclosingTerminatingBranch(node),
+    terminatesBranch: enclosingTerminatingBranch(node, source),
     ...enclosingIfArm(node),
   };
 }
@@ -761,7 +771,7 @@ function enclosingIfArm(node: Node): Pick<Assignment, "branchGroup" | "branchArm
   return {};
 }
 
-function enclosingTerminatingBranch(node: Node): boolean {
+function enclosingTerminatingBranch(node: Node, source: string): boolean {
   let current = node.parent;
   while (current !== null && current.type !== "function_declaration" && current.type !== "method_declaration" &&
     current.type !== "func_literal") {
@@ -769,7 +779,7 @@ function enclosingTerminatingBranch(node: Node): boolean {
       if (current.parent !== null && ["function_declaration", "method_declaration", "func_literal"].includes(current.parent.type)) {
         return false;
       }
-      if (blockTerminates(current)) return true;
+      if (blockTerminates(current, source)) return true;
     }
     current = current.parent;
   }
@@ -793,13 +803,13 @@ function callFact(source: string, node: Node, scopeId: string): Call | undefined
     text: sourceText(node, source).trim(),
     start: node.startIndex,
     scopeId,
-    executable: nodeIsReachable(node) && !insideUninvokedFunctionLiteral(node),
+    executable: nodeIsReachable(node, source) && !insideUninvokedFunctionLiteral(node, source),
     hitEscape: guard?.kind === "hit",
     ...(guard?.kind === "miss" ? { missBranch: guard.branch } : {}),
   };
 }
 
-function insideUninvokedFunctionLiteral(node: Node): boolean {
+function insideUninvokedFunctionLiteral(node: Node, source: string): boolean {
   let current: Node | null = node.parent;
   while (current !== null && !["function_declaration", "method_declaration"].includes(current.type)) {
     if (current.type === "func_literal") {
@@ -808,13 +818,37 @@ function insideUninvokedFunctionLiteral(node: Node): boolean {
       const parent = wrapper.parent;
       const directlyInvoked = parent?.type === "call_expression" &&
         parent.childForFieldName("function")?.id === wrapper.id;
-      const passedToCall = parent?.type === "argument_list" && parent.parent?.type === "call_expression";
+      const passedToKnownExecutingCall = parent?.type === "argument_list" &&
+        parent.parent?.type === "call_expression" && callbackIsSynchronouslyExecuted(parent.parent, wrapper, source);
       const assignedAndInvoked = localFunctionLiteralDefinitelyInvoked(current);
-      if (!directlyInvoked && !passedToCall && !assignedAndInvoked) return true;
+      if (!directlyInvoked && !passedToKnownExecutingCall && !assignedAndInvoked) return true;
     }
     current = current.parent;
   }
   return false;
+}
+
+function callbackIsSynchronouslyExecuted(call: Node, literal: Node, source: string): boolean {
+  const fn = call.childForFieldName("function")?.text.replace(/\s+/g, "") ?? "";
+  const args = call.childForFieldName("arguments")?.namedChildren ?? [];
+  if (args.at(-1)?.id !== literal.id) return false;
+  const selected = fn.match(/^([A-Za-z_]\w*)\.(?:Do|DoChan)$/)?.[1];
+  if (selected === undefined) return false;
+  let root = call;
+  while (root.parent !== null) root = root.parent;
+  const aliases = importAliases(source, root, "golang.org/x/sync/singleflight", "singleflight");
+  if (aliases.size === 0) return false;
+  return descendants(root, "var_spec").some((spec) => {
+    let owner = spec.parent;
+    while (owner !== null && owner.type !== "source_file" &&
+      !["function_declaration", "method_declaration", "func_literal"].includes(owner.type)) owner = owner.parent;
+    if (owner?.type !== "source_file") return false;
+    if (!declaredNames(spec, source).includes(selected)) return false;
+    const compact = sourceText(spec, source).replace(/\s+/g, "");
+    return [...aliases].some((alias) => new RegExp(
+      `^${escapeRegExp(selected)}(?:\\*?${escapeRegExp(alias)}\\.Group|=(?:&)?${escapeRegExp(alias)}\\.Group\\{)`,
+    ).test(compact));
+  });
 }
 
 function localFunctionLiteralDefinitelyInvoked(literal: Node): boolean {
@@ -869,26 +903,34 @@ function directInvocationStatement(statement: Node): Node | undefined {
   return candidate.type === "call_expression" ? candidate : undefined;
 }
 
-function nodeIsReachable(node: Node): boolean {
+function nodeIsReachable(node: Node, source: string): boolean {
   let current: Node | null = node;
   while (current?.parent !== null && current?.parent !== undefined) {
     const parent: Node = current.parent;
     if (parent.type === "statement_list") {
       const index = parent.namedChildren.findIndex((candidate) => candidate.id === current!.id);
-      if (index >= 0 && parent.namedChildren.slice(0, index).some(statementAlwaysTerminates)) return false;
+      if (index >= 0 && parent.namedChildren.slice(0, index).some((item) => statementAlwaysTerminates(item, source))) {
+        return false;
+      }
     }
     current = parent;
   }
   return true;
 }
 
-function statementAlwaysTerminates(node: Node): boolean {
+function statementAlwaysTerminates(node: Node, source: string): boolean {
   if (["return_statement", "break_statement", "continue_statement", "goto_statement"].includes(node.type)) return true;
+  if (node.type === "expression_statement") {
+    const call = node.namedChildren[0];
+    const fn = call?.type === "call_expression" ? call.childForFieldName("function") : null;
+    if (fn?.type === "identifier" && sourceText(fn, source) === "panic" &&
+      !identifierShadowedAt(node, "panic", source)) return true;
+  }
   if (node.type !== "if_statement") return false;
   const consequence = node.childForFieldName("consequence");
   const alternative = node.childForFieldName("alternative");
-  return consequence !== null && alternative !== null && blockTerminates(consequence) &&
-    (alternative.type === "if_statement" ? statementAlwaysTerminates(alternative) : blockTerminates(alternative));
+  return consequence !== null && alternative !== null && blockTerminates(consequence, source) &&
+    (alternative.type === "if_statement" ? statementAlwaysTerminates(alternative, source) : blockTerminates(alternative, source));
 }
 
 function commaOkGuard(value: Node, source: string):
@@ -920,17 +962,17 @@ function commaOkGuard(value: Node, source: string):
   const consequence = guard.childForFieldName("consequence");
   if (condition === null || consequence === null) return undefined;
   const compact = sourceText(condition, source).replace(/\s+/g, "").replace(/^\((.*)\)$/, "$1");
-  if (compact === ok && blockTerminates(consequence)) return { kind: "hit" };
+  if (compact === ok && blockTerminates(consequence, source)) return { kind: "hit" };
   if (compact === `!${ok}`) {
     return { kind: "miss", branch: { start: consequence.startIndex, end: consequence.endIndex } };
   }
   return undefined;
 }
 
-function blockTerminates(block: Node): boolean {
+function blockTerminates(block: Node, source: string): boolean {
   const statements = block.namedChildren.find((node) => node.type === "statement_list")?.namedChildren ?? [];
   const final = statements.at(-1);
-  return final !== undefined && ["return_statement", "continue_statement"].includes(final.type);
+  return final !== undefined && statementAlwaysTerminates(final, source);
 }
 
 function fixedAdmissions(source: string, body: Node, scopes: Map<string, LexicalScope>): AdmissionFact[] {
@@ -973,7 +1015,7 @@ function capacityGuardFacts(source: string, body: Node, scopes: Map<string, Lexi
     const match = sourceText(condition, source).replace(/\s+/g, "")
       .match(/^len\(([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\)(?:>=|>)([0-9][0-9A-Fa-f_xXoObB]*|[A-Za-z_]\w*)$/);
     if (match === null) continue;
-    const returns = blockTerminates(consequence);
+    const returns = blockTerminates(consequence, source);
     const evicts = evictsRangedEntry(consequence, source, match[1]!);
     if (!returns && !evicts) continue;
     result.push({
@@ -983,12 +1025,29 @@ function capacityGuardFacts(source: string, body: Node, scopes: Map<string, Lexi
       end: statement.endIndex,
       scopeId: scopeForNode(statement, scopes).id,
       kind: returns ? "return" : "ranged-eviction",
+      boundLocallyShadowed: /^[A-Za-z_]\w*$/.test(match[2]!) && locallyShadowedAt(statement, match[2]!, source),
     });
   }
   return result;
 }
 
 function identifierShadowedAt(reference: Node, name: string, source: string): boolean {
+  if (locallyShadowedAt(reference, name, source)) return true;
+  let root = reference;
+  while (root.parent !== null) root = root.parent;
+  return [
+    ...descendants(root, "var_spec"),
+    ...descendants(root, "const_spec"),
+    ...descendants(root, "function_declaration"),
+    ...descendants(root, "type_spec"),
+  ].some((declaration) => {
+    if (declaration.type !== "function_declaration" && declaration.parent?.parent?.type !== "source_file" &&
+      declaration.parent?.type !== "source_file") return false;
+    return declaredNames(declaration, source).includes(name);
+  });
+}
+
+function locallyShadowedAt(reference: Node, name: string, source: string): boolean {
   let callable: Node | null = reference;
   while (callable !== null && !["function_declaration", "method_declaration", "func_literal"].includes(callable.type)) {
     callable = callable.parent;
@@ -1002,6 +1061,7 @@ function identifierShadowedAt(reference: Node, name: string, source: string): bo
       const declarations = [
         ...descendants(body, "short_var_declaration"),
         ...descendants(body, "var_spec"),
+        ...descendants(body, "const_spec"),
         ...descendants(body, "range_clause"),
         ...descendants(body, "receive_statement"),
         ...descendants(body, "type_switch_statement"),
@@ -1010,18 +1070,7 @@ function identifierShadowedAt(reference: Node, name: string, source: string): bo
         declarationVisibleAt(declaration, reference) && declaredNames(declaration, source).includes(name))) return true;
     }
   }
-  let root = reference;
-  while (root.parent !== null) root = root.parent;
-  return [
-    ...descendants(root, "var_spec"),
-    ...descendants(root, "const_spec"),
-    ...descendants(root, "function_declaration"),
-    ...descendants(root, "type_spec"),
-  ].some((declaration) => {
-    if (declaration.type !== "function_declaration" && declaration.parent?.parent?.type !== "source_file" &&
-      declaration.parent?.type !== "source_file") return false;
-    return declaredNames(declaration, source).includes(name);
-  });
+  return false;
 }
 
 function declaredNames(declaration: Node, source: string): string[] {
@@ -1091,7 +1140,7 @@ function cacheAccesses(
 ): CacheAccess[] {
   const insertions = new Map<string, CacheAccess>();
   for (const assignment of descendants(body, "assignment_statement")) {
-    if (!nodeIsReachable(assignment) || insideUninvokedFunctionLiteral(assignment)) continue;
+    if (!nodeIsReachable(assignment, source) || insideUninvokedFunctionLiteral(assignment, source)) continue;
     const text = sourceText(assignment, source);
     const left = text.slice(0, text.indexOf("="));
     for (const match of left.matchAll(/([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\s*\[([^\]]+)\]/g)) {
@@ -1115,7 +1164,7 @@ function cacheAccesses(
 
   const accesses: CacheAccess[] = [...insertions.values()];
   for (const index of descendants(body, "index_expression")) {
-    if (!nodeIsReachable(index) || insideUninvokedFunctionLiteral(index)) continue;
+    if (!nodeIsReachable(index, source) || insideUninvokedFunctionLiteral(index, source)) continue;
     const text = sourceText(index, source);
     const match = text.match(/^\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\s*\[([\s\S]+)\]\s*$/);
     if (match === null) continue;
@@ -1591,7 +1640,7 @@ function findMaterialWork(
   summaries: Map<string, Dependencies>,
 ): Call | undefined {
   return fn.calls.find((call) => {
-    if (call.start <= lookup.start || call.start >= insertion.end || !isMaterialCall(call, fn)) return false;
+    if (call.start <= lookup.start || call.start >= insertion.end || !isMaterialCall(call, fn, byName)) return false;
     const env = environmentAt(fn, call.start, call.scopeId, seeds, byName, summaries);
     return materialFeedsInsertion(fn, call, insertion) && call.args.some((argument) =>
       sameRequestOrigin(expressionDependencies(argument, env, byName, summaries), keyOrigins));
@@ -1696,11 +1745,22 @@ function replayMaterialAssignments(
   return values;
 }
 
-function isMaterialCall(call: Call, fn: FunctionFact): boolean {
+function isMaterialCall(
+  call: Call,
+  fn: FunctionFact,
+  byName: Map<string, FunctionFact>,
+  seen = new Set<string>(),
+): boolean {
   const receiver = call.functionText.match(/^([A-Za-z_]\w*)\./)?.[1];
   if (receiver !== undefined && fn.httpAliases.has(receiver) && /^(?:Get|Post|Head)$/.test(call.name)) return true;
   if (receiver !== undefined && fn.fileAliases.has(receiver) && /^(?:Open|ReadFile)$/.test(call.name)) return true;
-  if (/(?:fetch|Fetch|download|Download|retrieve|Retrieve|read|Read|load|Load).*(?:CDN|Cdn|Remote|remote|Bucket|bucket|Storage|storage|File|file|ObjectStore|objectStore)$/.test(call.name)) return true;
+  if (/(?:fetch|Fetch|download|Download|retrieve|Retrieve|read|Read|load|Load).*(?:CDN|Cdn|Remote|remote|Bucket|bucket|Storage|storage|File|file|ObjectStore|objectStore)$/.test(call.name)) {
+    const callee = byName.get(call.name);
+    if (callee === undefined) return true;
+    if (seen.has(callee.id)) return false;
+    const nextSeen = new Set(seen).add(callee.id);
+    return callee.calls.some((nested) => isMaterialCall(nested, callee, byName, nextSeen));
+  }
   if (!/^(?:Query|QueryContext|QueryRow|QueryRowContext|Scan)$/.test(call.name)) return false;
   return receiver !== undefined && fn.params.some((parameter) =>
     parameter.name === receiver && parameter.sqlDatabase);
@@ -1721,6 +1781,34 @@ function requestPathTo(target: FunctionFact, edges: CallEdge[]): CallEdge[] {
     }
   }
   return result;
+}
+
+function receiverCacheIsProvenRequestLocal(
+  fn: FunctionFact,
+  cacheId: string,
+  requestPath: CallEdge[],
+): boolean {
+  if (!cacheId.startsWith("field:") || fn.receiverName === undefined || fn.receiverType === undefined) return false;
+  const receiverType = fn.receiverType;
+  const incoming = requestPath.filter((edge) => edge.callee.id === fn.id);
+  if (incoming.length === 0) return false;
+  return incoming.every((edge) => {
+    const receiver = edge.call.functionText.match(/^([A-Za-z_]\w*)\.[A-Za-z_]\w*$/)?.[1];
+    if (receiver === undefined) return false;
+    const ancestors = scopeAncestors(edge.caller.scopes, edge.scopeId);
+    const assignments = edge.caller.assignments.filter((assignment) =>
+      assignment.start < edge.start && edge.start <= assignment.visibilityEnd && assignment.targets.includes(receiver) &&
+      (ancestors.includes(assignment.scopeId) || (!assignment.declaration &&
+        callableScope(edge.caller.scopes, assignment.scopeId) === callableScope(edge.caller.scopes, edge.scopeId))));
+    const latest = assignments.at(-1);
+    if (latest === undefined || !latest.declaration) return false;
+    const index = latest.targets.indexOf(receiver);
+    const value = latest.expressions[index] ?? (index === 0 ? latest.expressions[0] : undefined);
+    if (value === undefined) return false;
+    const compact = value.replace(/\s+/g, "");
+    const type = escapeRegExp(receiverType);
+    return new RegExp(`^(?:&?${type}\\{|new\\(${type}\\))`).test(compact);
+  });
 }
 
 function hasFiniteAdmission(
@@ -1761,7 +1849,7 @@ function hasHardCacheBound(
   for (const guard of fn.capacityGuards.filter((fact) => fact.start < material.start)) {
     const provenFinite = isPositiveGoInteger(guard.bound) || finiteConstants.has(`${fn.scope}:${guard.bound}`);
     const relativeStart = guard.start - fn.start;
-    if (provenFinite && isDirectGuardForEndpoint(before, relativeStart) &&
+    if (provenFinite && !guard.boundLocallyShadowed && isDirectGuardForEndpoint(before, relativeStart) &&
       resolveCacheAt(fn, guard.cache, guard.start, guard.scopeId, caches) === insertion.cacheId &&
       capacityGuardRemainsValid(fn, guard, insertion, material, caches, functions)) {
       return true;
@@ -1862,6 +1950,7 @@ function changedLineInRange(
   if (file.status === "repository" || file.status === "added") return startLine;
   for (let line = startLine; line <= endLine; line += 1) {
     if (!file.changedLines.has(line)) continue;
+    if (file.deletionAnchors?.has(line)) return line;
     if (file.previous === undefined) return line;
     const currentLine = (maskGoNonCode(file.current, false).split("\n")[line - 1] ?? "").trimEnd();
     const previousLine = (maskGoNonCode(file.previous, false).split("\n")[line - 1] ?? "").trimEnd();

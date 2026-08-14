@@ -3,6 +3,7 @@ export interface SourceRevision {
   current: string;
   previous?: string;
   changedLines: Set<number>;
+  deletionAnchors?: Set<number>;
   status: "added" | "modified" | "repository";
 }
 

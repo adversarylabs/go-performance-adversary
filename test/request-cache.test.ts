@@ -291,11 +291,11 @@ test("material-result flow kills overwritten and shadowed values but preserves c
   const shadowed = baseHeaderCase(`
   if _, ok := cache[key]; ok { return }
   value := fetchRemoteFile(key)
-  run(func(value []byte) { cache[key] = value })`, false);
+  func(value []byte) { cache[key] = value }(nil)`, false);
   const captured = baseHeaderCase(`
   if _, ok := cache[key]; ok { return }
   value := fetchRemoteFile(key)
-  run(func(done bool) { cache[key] = value; _ = done })`, false);
+  func(done bool) { cache[key] = value; _ = done }(true)`, false);
   for (const [name, source, expected] of [
     ["overwritten", overwritten, false],
     ["shadowed", shadowed, false],
@@ -565,12 +565,12 @@ test("allowlist proof never combines cases and default arms from different switc
 
 test("direct guards inside closures dominate work but nested optional guards do not", async () => {
   const direct = baseHeaderCase(`
-  run(func() {
+  func() {
     if _, ok := cache[key]; ok { return }
     if len(cache) >= maxEntries { return }
     value := fetchRemoteFile(key)
     cache[key] = value
-  })`, false);
+  }()`, false);
   const nested = direct.replace(
     "if len(cache) >= maxEntries { return }",
     "if enforceLimit { if len(cache) >= maxEntries { return } }",
@@ -651,12 +651,12 @@ test("closure parameters shadow only matching names while captured request value
 import "net/http"
 var cache = map[string][]byte{}
 func handle(req *http.Request) {
-  run(func(value []byte) {
+  func(value []byte) {
     key := req.URL.Query().Get("tenant")
     if _, ok := cache[key]; ok { return }
     value = fetchRemoteFile(key)
     cache[key] = value
-  })
+  }(nil)
 }`;
   const shadowed = captured.replace("func(value []byte)", "func(value []byte, req *fakeRequest)");
   const reported = await analyzeDiscovery({ mode: "repository", files: [revision("captured-request.go", captured, "repository")] });
@@ -671,11 +671,11 @@ import "net/http"
 var cache = map[string][]byte{}
 func handle(req *http.Request) {
   key := req.Header.Get("X-Tenant")
-  run(func(key string) {
+  func(key string) {
     if _, ok := cache[key]; ok { return }
     value := fetchRemoteFile(key)
     cache[key] = value
-  })
+  }("fixed")
 }`;
   const cacheShadow = `package p
 import "net/http"
@@ -683,11 +683,11 @@ var cache = map[string][]byte{}
 func handle(req *http.Request) {
   local := cache
   key := req.Header.Get("X-Tenant")
-  run(func(local map[string][]byte) {
+  func(local map[string][]byte) {
     if _, ok := local[key]; ok { return }
     value := fetchRemoteFile(key)
     local[key] = value
-  })
+  }(map[string][]byte{})
 }`;
   for (const [name, source] of [["request-shadow", requestShadow], ["cache-shadow", cacheShadow]] as const) {
     const analysis = await analyzeDiscovery({ mode: "repository", files: [revision(`${name}.go`, source, "repository")] });
@@ -921,11 +921,11 @@ test("merges exhaustive branch values and still analyzes invoked callbacks", asy
   value := fetchRemoteFile(key)
   if enabled { value = []byte("a") } else { value = []byte("b") }
   cache[key] = value`, false);
-  const callback = baseHeaderCase(`run(func() {
+  const callback = baseHeaderCase(`func() {
     if _, ok := cache[key]; ok { return }
     value := fetchRemoteFile(key)
     cache[key] = value
-  })`, false);
+  }()`, false);
   for (const [name, source, expected] of [
     ["all-key-paths-cleared", bothKeysCleared, false],
     ["one-key-path-tainted", oneKeyTainted, true],
@@ -1110,6 +1110,113 @@ test("ignores unreachable miss work and compares changed multiline nodes by posi
   assert.equal(reported.signals.find((item) => item.ruleId === ruleId)?.line, changedLine);
 });
 
+test("does not treat stored callbacks as executed miss paths", async () => {
+  const source = `package p
+import (
+  "net/http"
+  "os"
+)
+var cache = map[string][]byte{}
+var callbacks []func()
+func handle(req *http.Request) {
+  key := req.Header.Get("X-Tenant")
+  callbacks = append(callbacks, func() {
+    if _, ok := cache[key]; ok { return }
+    value, _ := os.ReadFile(key)
+    cache[key] = value
+  })
+}`;
+  const analysis = await analyzeDiscovery({ mode: "repository", files: [revision("stored.go", source, "repository")] });
+  assert.equal(analysis.signals.some((item) => item.ruleId === ruleId), false);
+
+  const arbitraryDo = source
+    .replace("var callbacks []func()", "var registry fakeRegistry")
+    .replace("callbacks = append(callbacks, func() {", "registry.Do(\"deferred\", func() {");
+  const arbitraryAnalysis = await analyzeDiscovery({
+    mode: "repository",
+    files: [revision("arbitrary-do.go", arbitraryDo, "repository")],
+  });
+  assert.equal(arbitraryAnalysis.signals.some((item) => item.ruleId === ruleId), false);
+});
+
+test("does not report cache work after an unconditional builtin panic", async () => {
+  const source = baseHeaderCase(`panic("disabled")
+  if _, ok := cache[key]; ok { return }
+  value := fetchRemoteFile(key)
+  cache[key] = value`, false);
+  const analysis = await analyzeDiscovery({ mode: "repository", files: [revision("panic.go", source, "repository")] });
+  assert.equal(analysis.signals.some((item) => item.ruleId === ruleId), false);
+
+  const shadowed = source.replace("func handle(req *http.Request) {", "func handle(req *http.Request, panic func(any)) {");
+  const shadowedAnalysis = await analyzeDiscovery({
+    mode: "repository",
+    files: [revision("shadowed-panic.go", shadowed, "repository")],
+  });
+  assert.equal(shadowedAnalysis.signals.some((item) => item.ruleId === ruleId), true);
+});
+
+test("does not call a receiver cache request-persistent when its receiver is allocated per request", async () => {
+  const source = `package p
+import (
+  "net/http"
+  "os"
+)
+type scratch struct { cache map[string][]byte }
+func (s *scratch) fill(key string) {
+  if _, ok := s.cache[key]; ok { return }
+  value, _ := os.ReadFile(key)
+  s.cache[key] = value
+}
+func handle(req *http.Request) {
+  s := &scratch{cache: map[string][]byte{}}
+  s.fill(req.Header.Get("X-Tenant"))
+}`;
+  const analysis = await analyzeDiscovery({ mode: "repository", files: [revision("local-receiver.go", source, "repository")] });
+  assert.equal(analysis.signals.some((item) => item.ruleId === ruleId), false);
+
+  const shared = source.replace(
+    "func handle(req *http.Request) {\n  s := &scratch{cache: map[string][]byte{}}\n  s.fill(req.Header.Get(\"X-Tenant\"))",
+    "func handle(s *scratch, req *http.Request) {\n  { s := &scratch{cache: map[string][]byte{}}; _ = s }\n  s.fill(req.Header.Get(\"X-Tenant\"))",
+  );
+  const sharedAnalysis = await analyzeDiscovery({
+    mode: "repository",
+    files: [revision("shared-receiver.go", shared, "repository")],
+  });
+  assert.equal(sharedAnalysis.signals.some((item) => item.ruleId === ruleId), true);
+});
+
+test("does not confuse a shadowing parameter with a finite package bound", async () => {
+  const source = `package p
+import "net/http"
+const maxEntries = 64
+var cache = map[string][]byte{}
+func handle(req *http.Request, maxEntries int) {
+  key := req.Header.Get("X-Tenant")
+  if _, ok := cache[key]; ok { return }
+  if len(cache) >= maxEntries { return }
+  value := fetchRemoteFile(key)
+  cache[key] = value
+}`;
+  const analysis = await analyzeDiscovery({ mode: "repository", files: [revision("shadowed-bound.go", source, "repository")] });
+  assert.equal(analysis.signals.some((item) => item.ruleId === ruleId), true);
+});
+
+test("does not infer material backend work from a misleading local helper name", async () => {
+  const source = `package p
+import "net/http"
+var cache = map[string][]byte{}
+var embeddedFiles = map[string][]byte{}
+func readCachedFile(key string) []byte { return embeddedFiles[key] }
+func handle(req *http.Request) {
+  key := req.Header.Get("X-Tenant")
+  if _, ok := cache[key]; ok { return }
+  value := readCachedFile(key)
+  cache[key] = value
+}`;
+  const analysis = await analyzeDiscovery({ mode: "repository", files: [revision("local-helper.go", source, "repository")] });
+  assert.equal(analysis.signals.some((item) => item.ruleId === ruleId), false);
+});
+
 function baseHeaderCase(body: string, includeLookup = true): string {
   return `package p
 import "net/http"
@@ -1138,6 +1245,7 @@ func (p *Provider) serve(req *http.Request) {
     revision("pkg/services/frontend/webassets/preview.go", `package webassets
 import (
   "context"
+  "golang.org/x/sync/singleflight"
   "sync"
   "time"
 )
@@ -1145,6 +1253,7 @@ const previewCacheTTL = 30 * time.Second
 var (
   previewCacheMu sync.Mutex
   previewCache = map[string]cachedPreviewAssets{}
+  previewFlights singleflight.Group
 )
 func ResolvePreviewAssetsURL(baseURL, folder string) (string, error) {
   base := baseURL
