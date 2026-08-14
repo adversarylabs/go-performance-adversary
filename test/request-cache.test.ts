@@ -1237,6 +1237,15 @@ func handle(req *http.Request) {
   });
   assert.equal(transitiveAnalysis.signals.some((item) => item.ruleId === ruleId), true);
 
+  const plainName = transitive
+    .replace("func fetchRemoteFile(key string) []byte { return helper(key) }", "func load(key string) []byte { return helper(key) }")
+    .replace("value := fetchRemoteFile(key)", "value := load(key)");
+  const plainNameAnalysis = await analyzeDiscovery({
+    mode: "repository",
+    files: [revision("plain-local-helper.go", plainName, "repository")],
+  });
+  assert.equal(plainNameAnalysis.signals.some((item) => item.ruleId === ruleId), true);
+
   const cycle = source
     .replace("func readCachedFile(key string) []byte { return embeddedFiles[key] }", [
       "func readCachedFile(key string) []byte { return helper(key) }",

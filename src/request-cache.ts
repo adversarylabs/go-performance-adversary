@@ -1758,10 +1758,12 @@ function isMaterialCall(
   seen = new Set<string>(),
 ): boolean {
   if (isDirectMaterialCall(call, fn)) return true;
-  if (!materialNameSuggestsBackend(call.name)) return false;
   const callee = byName.get(call.name);
-  if (callee === undefined) return true;
-  return functionPerformsMaterialWork(callee, byName, new Set(seen).add(callee.id));
+  if (callee !== undefined) {
+    if (seen.has(callee.id)) return false;
+    return functionPerformsMaterialWork(callee, byName, new Set(seen).add(callee.id));
+  }
+  return materialNameSuggestsBackend(call.name);
 }
 
 function functionPerformsMaterialWork(

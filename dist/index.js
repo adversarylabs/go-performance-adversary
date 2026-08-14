@@ -22810,10 +22810,12 @@ function replayMaterialAssignments(assignments, base, call) {
 }
 function isMaterialCall(call, fn, byName, seen = /* @__PURE__ */ new Set()) {
   if (isDirectMaterialCall(call, fn)) return true;
-  if (!materialNameSuggestsBackend(call.name)) return false;
   const callee = byName.get(call.name);
-  if (callee === void 0) return true;
-  return functionPerformsMaterialWork(callee, byName, new Set(seen).add(callee.id));
+  if (callee !== void 0) {
+    if (seen.has(callee.id)) return false;
+    return functionPerformsMaterialWork(callee, byName, new Set(seen).add(callee.id));
+  }
+  return materialNameSuggestsBackend(call.name);
 }
 function functionPerformsMaterialWork(fn, byName, seen) {
   return fn.calls.some((call) => {
