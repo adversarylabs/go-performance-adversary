@@ -71,8 +71,8 @@ jobs:
         # domain/name remote refs
         uses: adversarylabs/actions/push@9d990ebe8956cfe876331d21798d53e71c134c66
         with:
-          # beta.1 rejects permissions.model; pin stable CLI.
-          cli-version: 2026.7.26
+          # 2026.8.3+ publishes README.md and CHECKS.md as catalog OCI referrers.
+          cli-version: 2026.8.14
           path: .
           token: ${{ secrets.ADVERSARY_SERVICE_ACCOUNT_TOKEN }}
           # CI is the publish authority — full catalog path, no adversarylabs/ prefix.
