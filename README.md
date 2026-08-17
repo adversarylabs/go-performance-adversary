@@ -1,17 +1,21 @@
 # Go Performance adversary
 
-Go Performance reviews material allocation, copying, retention, buffering, and contention risk with evidence rather than micro-optimization style advice.
+Reviews Go for resource amplification, defer-in-loop, per-request clients, hot-path regexp compilation, and quadratic string building.
 
-The review focuses on invariant regular-expression compilation in loops, redundant byte/string copies, and request-controlled expensive caches without cardinality bounds.
+## Goals
 
-## Fixtures and calibration
+The adversary is designed to produce a small number of high-confidence,
+actionable findings grounded in concrete repository evidence. Its review should
+be deterministic where possible, explicit about impact, and quiet when the
+available evidence does not justify a finding.
 
-Five graded fixtures own expected review snapshots. The 61-repository corpus calibrates allocation and hot-path judgment.
+## Scope
 
-## Automatic detection
+It evaluates changed Go code for high-confidence allocation, caching, compilation, copying, buffering, and hot-path performance hazards.
 
-`adversary auto` selects Go Performance for changed Go source. Runtime benchmark, profile, and call-path evidence will later make selection more conservative.
+The complete detector or review inventory is maintained in
+[CHECKS.md](CHECKS.md).
 
-## Development
+## Boundaries
 
-Run `npm test`, `adversary validate .`, and `adversary pack --check .`.
+It owns only this Go specialty. Other Go concerns remain with the corresponding `go/*` adversaries, and it does not execute or modify the target repository.
