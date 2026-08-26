@@ -1,6 +1,7 @@
 import { domain } from "./domain.js";
 import { descendants, parseGo, sourceText } from "./parser.js";
 import { requestKeyedCacheSignals } from "./request-cache.js";
+import { stringConcatLoopSignals } from "./string-concat.js";
 import { type Analysis, type Discovery, type PositiveSignal, type Signal, type SourceRevision } from "./types.js";
 import { type Node } from "web-tree-sitter";
 
@@ -16,6 +17,11 @@ export async function analyzeDiscovery(discovery: Discovery): Promise<Analysis> 
         try {
           if (tree.rootNode.hasError) throw new Error("Go source contains syntax errors");
           signals.push(...cacheElementFootprintSignals(file, tree.rootNode));
+          const stringSignals = stringConcatLoopSignals(file, tree.rootNode);
+          const previousStringSignals = file.previous === undefined
+            ? []
+            : await analyzePreviousStringConcats(file);
+          signals.push(...newChangedStringConcats(file, stringSignals, previousStringSignals));
         } finally {
           tree.delete();
         }
@@ -45,6 +51,41 @@ export async function analyzeDiscovery(discovery: Discovery): Promise<Analysis> 
     positives: positives.sort(byLocation),
     parseErrors: parseErrors.sort((left, right) => left.path.localeCompare(right.path)),
   };
+}
+
+async function analyzePreviousStringConcats(file: SourceRevision): Promise<Signal[]> {
+  if (file.previous === undefined) return [];
+  const tree = await parseGo(file.previous);
+  try {
+    if (tree.rootNode.hasError) return [];
+    return stringConcatLoopSignals(
+      { path: file.path, current: file.previous, status: "repository", changedLines: new Set() },
+      tree.rootNode,
+    );
+  } finally {
+    tree.delete();
+  }
+}
+
+function newChangedStringConcats(file: SourceRevision, current: Signal[], previous: Signal[]): Signal[] {
+  const previousCounts = new Map<string, number>();
+  for (const signal of previous) {
+    const key = String(signal.data.semanticKey ?? "");
+    previousCounts.set(key, (previousCounts.get(key) ?? 0) + 1);
+  }
+
+  return current.filter((signal) => {
+    const loopLine = Number(signal.data.loopLine);
+    const locallyChanged = changed(file, signal.line, signal.endLine) ||
+      (Number.isInteger(loopLine) && file.changedLines.has(loopLine));
+    if (!locallyChanged) return false;
+
+    const key = String(signal.data.semanticKey ?? "");
+    const count = previousCounts.get(key) ?? 0;
+    if (count === 0) return true;
+    previousCounts.set(key, count - 1);
+    return false;
+  });
 }
 
 interface FootprintClaim {
