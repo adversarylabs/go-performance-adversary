@@ -50,13 +50,13 @@ export const domain: DomainDefinition = {
     },
     {
       id: "go-perf.string-concat-loop",
-      title: "A string is built with += inside a loop",
+      title: "A string accumulator grows inside an unbounded loop",
       category: "performance",
       severity: "medium",
       confidence: "high",
       summary: (count) =>
-        `${count} loop${count === 1 ? "" : "s"} concatenate strings with quadratic copying.`,
-      whyItMatters: "Each += reallocates and copies the whole string — O(n²) on input size.",
+        `${count} loop${count === 1 ? "" : "s"} grow a cross-iteration string accumulator with quadratic copying.`,
+      whyItMatters: "Each accumulator update reallocates and copies the whole string — O(n²) on input size.",
       impact: "Fine at 10 items, an outage at millions.",
       recommendation: "Use strings.Builder (with Grow when size is known) or strings.Join.",
     },
@@ -110,7 +110,6 @@ export const domain: DomainDefinition = {
         ...deferInLoopSignals(file),
         ...httpClientPerRequestSignals(file),
         ...regexpHotPathSignals(file),
-        ...stringConcatLoopSignals(file),
         ...largeValueCopySignals(file),
       ],
       positives: [
@@ -304,56 +303,6 @@ function regexpHotPathSignals(file: SourceRevision): Signal[] {
     seen.add(key);
     return true;
   });
-}
-
-function stringConcatLoopSignals(file: SourceRevision): Signal[] {
-  const signals: Signal[] = [];
-  const lines = file.current.split("\n");
-  let loopDepth = 0;
-  let braceDepth = 0;
-  const loopBraceAt: number[] = [];
-
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i] ?? "";
-    if (/^\s*for\b/.test(line)) {
-      loopDepth += 1;
-      loopBraceAt.push(braceDepth);
-    }
-    const opens = (line.match(/\{/g) ?? []).length;
-    const closes = (line.match(/\}/g) ?? []).length;
-    braceDepth += opens - closes;
-
-    if (loopDepth > 0 && !/^\s*\/\//.test(line) && !/\b(?:append|make)\b/.test(line)) {
-      // High-precision string concat only: string literal on the line, or
-      // well-known string accumulator names with += / = x + y.
-      const stringyAccum =
-        /\b(?:out|s|str|text|msg|buf|body|joined|result|acc|builder)\s*(?:\+=|=\s*\w+\s*\+)/.test(
-          line,
-        ) || /\+=\s*["`]|=\s*\w+\s*\+\s*["`]|\+\s*["`]/.test(line);
-      const numericAccum =
-        /\b(?:total|sum|count|n|i|idx|index|num|score|len|bytes|size|offset)\s*\+=/.test(line) &&
-        !/["`]/.test(line);
-      if (stringyAccum && !numericAccum) {
-        signals.push({
-          ruleId: "go-perf.string-concat-loop",
-          path: file.path,
-          line: i + 1,
-          message: "String concatenation inside a loop reallocates on every iteration.",
-          snippet: line.trim().slice(0, 300),
-          data: {},
-        });
-      }
-    }
-
-    while (loopDepth > 0 && braceDepth <= (loopBraceAt[loopBraceAt.length - 1] ?? 0) && closes > 0) {
-      const startDepth = loopBraceAt[loopBraceAt.length - 1] ?? 0;
-      if (braceDepth <= startDepth) {
-        loopDepth -= 1;
-        loopBraceAt.pop();
-      } else break;
-    }
-  }
-  return signals;
 }
 
 /**

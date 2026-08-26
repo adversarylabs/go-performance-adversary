@@ -3647,12 +3647,7 @@ var require_fast_uri = __commonJS({
     }
     function resolve3(baseURI, relativeURI, options) {
       const schemelessOptions = options ? Object.assign({ scheme: "null" }, options) : { scheme: "null" };
-      const { parsed: baseParsed, malformedAuthorityOrPort: baseMalformed } = parseWithStatus(baseURI, schemelessOptions);
-      const { parsed: relativeParsed, malformedAuthorityOrPort: relativeMalformed } = parseWithStatus(relativeURI, schemelessOptions);
-      if (baseMalformed || relativeMalformed) {
-        throw new Error(baseParsed.error || relativeParsed.error || "URI is malformed.");
-      }
-      const resolved = resolveComponent(baseParsed, relativeParsed, schemelessOptions, true);
+      const resolved = resolveComponent(parse(baseURI, schemelessOptions), parse(relativeURI, schemelessOptions), schemelessOptions, true);
       schemelessOptions.skipEscape = true;
       return serialize(resolved, schemelessOptions);
     }
@@ -3778,7 +3773,6 @@ var require_fast_uri = __commonJS({
     }
     var URI_PARSE = /^(?:([^#/:?]+):)?(?:\/\/((?:([^#/?@]*)@)?(\[[^#/?\]]+\]|[^#/:?]*)(?::(\d*))?))?([^#?]*)(?:\?([^#]*))?(?:#((?:.|[\n\r])*))?/u;
     var AUTHORITY_PREFIX = /^(?:[^#/:?]+:)?\/\/([^/?#]*)/;
-    var AUTHORITY_INTRODUCER_REGION = /^(?:[^#/:?]+:)?([/\\\t\n\r]*)/;
     function getParseError(parsed, matches) {
       if (matches[2] !== void 0 && parsed.path && parsed.path[0] !== "/") {
         return 'URI path must start with "/" when authority is present.';
@@ -3812,20 +3806,6 @@ var require_fast_uri = __commonJS({
       if (authorityMatch !== null && authorityMatch[1].indexOf("\\") !== -1) {
         parsed.error = "URI authority must not contain a literal backslash.";
         malformedAuthorityOrPort = true;
-      }
-      const introducerMatch = uri.match(AUTHORITY_INTRODUCER_REGION);
-      if (introducerMatch !== null) {
-        const region = introducerMatch[1];
-        const normalizedRegion = region.replace(/[\t\n\r]/g, "");
-        if (normalizedRegion.length >= 2) {
-          if (normalizedRegion.slice(0, 2) !== "//") {
-            parsed.error = parsed.error || "URI authority must not contain a literal backslash.";
-            malformedAuthorityOrPort = true;
-          } else if (region.length !== normalizedRegion.length) {
-            parsed.error = parsed.error || "URI authority introducer must not contain whitespace.";
-            malformedAuthorityOrPort = true;
-          }
-        }
       }
       const matches = uri.match(URI_PARSE);
       if (matches) {
@@ -17126,12 +17106,12 @@ var domain = {
     },
     {
       id: "go-perf.string-concat-loop",
-      title: "A string is built with += inside a loop",
+      title: "A string accumulator grows inside an unbounded loop",
       category: "performance",
       severity: "medium",
       confidence: "high",
-      summary: (count) => `${count} loop${count === 1 ? "" : "s"} concatenate strings with quadratic copying.`,
-      whyItMatters: "Each += reallocates and copies the whole string \u2014 O(n\xB2) on input size.",
+      summary: (count) => `${count} loop${count === 1 ? "" : "s"} grow a cross-iteration string accumulator with quadratic copying.`,
+      whyItMatters: "Each accumulator update reallocates and copies the whole string \u2014 O(n\xB2) on input size.",
       impact: "Fine at 10 items, an outage at millions.",
       recommendation: "Use strings.Builder (with Grow when size is known) or strings.Join."
     },
@@ -17177,7 +17157,6 @@ var domain = {
         ...deferInLoopSignals(file),
         ...httpClientPerRequestSignals(file),
         ...regexpHotPathSignals(file),
-        ...stringConcatLoopSignals(file),
         ...largeValueCopySignals(file)
       ],
       positives: [
@@ -17343,47 +17322,6 @@ function regexpHotPathSignals(file) {
     seen.add(key);
     return true;
   });
-}
-function stringConcatLoopSignals(file) {
-  const signals = [];
-  const lines = file.current.split("\n");
-  let loopDepth = 0;
-  let braceDepth2 = 0;
-  const loopBraceAt = [];
-  for (let i2 = 0; i2 < lines.length; i2 += 1) {
-    const line = lines[i2] ?? "";
-    if (/^\s*for\b/.test(line)) {
-      loopDepth += 1;
-      loopBraceAt.push(braceDepth2);
-    }
-    const opens = (line.match(/\{/g) ?? []).length;
-    const closes = (line.match(/\}/g) ?? []).length;
-    braceDepth2 += opens - closes;
-    if (loopDepth > 0 && !/^\s*\/\//.test(line) && !/\b(?:append|make)\b/.test(line)) {
-      const stringyAccum = /\b(?:out|s|str|text|msg|buf|body|joined|result|acc|builder)\s*(?:\+=|=\s*\w+\s*\+)/.test(
-        line
-      ) || /\+=\s*["`]|=\s*\w+\s*\+\s*["`]|\+\s*["`]/.test(line);
-      const numericAccum = /\b(?:total|sum|count|n|i|idx|index|num|score|len|bytes|size|offset)\s*\+=/.test(line) && !/["`]/.test(line);
-      if (stringyAccum && !numericAccum) {
-        signals.push({
-          ruleId: "go-perf.string-concat-loop",
-          path: file.path,
-          line: i2 + 1,
-          message: "String concatenation inside a loop reallocates on every iteration.",
-          snippet: line.trim().slice(0, 300),
-          data: {}
-        });
-      }
-    }
-    while (loopDepth > 0 && braceDepth2 <= (loopBraceAt[loopBraceAt.length - 1] ?? 0) && closes > 0) {
-      const startDepth = loopBraceAt[loopBraceAt.length - 1] ?? 0;
-      if (braceDepth2 <= startDepth) {
-        loopDepth -= 1;
-        loopBraceAt.pop();
-      } else break;
-    }
-  }
-  return signals;
 }
 function largeValueCopySignals(file) {
   const signals = [];
@@ -23087,6 +23025,303 @@ function maskGoNonCode(source, maskStrings = true) {
   return output.join("");
 }
 
+// src/string-concat.ts
+var RULE_ID2 = "go-perf.string-concat-loop";
+var SMALL_FIXED_BOUND = 32;
+function stringConcatLoopSignals(file, root) {
+  const signals = [];
+  for (const assignment of descendants(root, "assignment_statement")) {
+    const loop = nearestAncestor(assignment, "for_statement");
+    if (loop === null || !sameNode(nearestCallable(assignment), nearestCallable(loop))) continue;
+    if (isProvablySmallFixedLoop(loop, file.current)) continue;
+    const left = singleExpression(assignment.childForFieldName("left"));
+    const right = singleExpression(assignment.childForFieldName("right"));
+    if (left?.type !== "identifier" || right === null) continue;
+    const name2 = sourceText(left, file.current);
+    const operator = assignmentOperator(assignment, file.current);
+    const declaration = resolveDeclaration(root, left, name2, file.current);
+    if (declaration === null || declaration.node.startIndex >= loop.startIndex) continue;
+    const selfReferential = operator === "=" && growsFromSameValue(right, name2, file.current);
+    const compound = operator === "+=";
+    if (!compound && !selfReferential) continue;
+    if (!declaration.isString && !expressionProvesString(right, file.current)) continue;
+    if (hasPerIterationReset(loop, assignment, name2, file.current)) continue;
+    signals.push({
+      ruleId: RULE_ID2,
+      path: file.path,
+      line: assignment.startPosition.row + 1,
+      ...assignment.endPosition.row === assignment.startPosition.row ? {} : { endLine: assignment.endPosition.row + 1 },
+      message: `String accumulator ${name2} grows across iterations and reallocates on every update.`,
+      snippet: sourceText(assignment, file.current).trim().slice(0, 300),
+      data: {
+        accumulator: name2,
+        operator,
+        loopLine: loop.startPosition.row + 1,
+        declarationLine: declaration.node.startPosition.row + 1,
+        semanticKey: semanticKey(assignment, loop, declaration.node, name2, operator, file.current)
+      }
+    });
+  }
+  return signals;
+}
+function semanticKey(assignment, loop, declaration, name2, operator, source) {
+  const callable = nearestCallable(assignment);
+  const callableName = callable?.childForFieldName("name");
+  const receiver = callable?.childForFieldName("receiver");
+  const control = loop.namedChildren.find((child) => child.type !== "block");
+  return [
+    callable?.type ?? "package",
+    callableName === null || callableName === void 0 ? "" : semanticText(callableName, source),
+    receiver === null || receiver === void 0 ? "" : semanticText(receiver, source),
+    name2,
+    operator,
+    semanticText(declaration, source),
+    control === void 0 ? "for{}" : semanticText(control, source),
+    semanticText(assignment, source)
+  ].join("|");
+}
+function semanticText(node, source) {
+  if (node.type === "comment") return "";
+  if (node.childCount === 0) return sourceText(node, source).replace(/\s+/g, "");
+  return node.children.filter((child) => child.type !== "comment").map((child) => semanticText(child, source)).join("");
+}
+function resolveDeclaration(root, use, name2, source) {
+  const candidates = [];
+  const callable = nearestCallable(use);
+  for (const node of descendants(root, "var_spec")) {
+    if (node.startIndex >= use.startIndex || !visibleFromCallable(node, callable)) continue;
+    const names = declarationNames(node.childForFieldName("name"), source);
+    const index = names.indexOf(name2);
+    if (index < 0 || !scopeContains(node, use)) continue;
+    const type = node.childForFieldName("type");
+    const value = expressionAt(node.childForFieldName("value"), index);
+    candidates.push({
+      node,
+      isString: type !== null ? sourceText(type, source).replace(/\s+/g, "") === "string" : value !== null && expressionProvesString(value, source)
+    });
+  }
+  for (const node of descendants(root, "parameter_declaration")) {
+    if (node.startIndex >= use.startIndex || !visibleFromCallable(node, callable)) continue;
+    if (!declarationNames(node.childForFieldName("name"), source).includes(name2)) continue;
+    if (!scopeContains(node, use)) continue;
+    const type = node.childForFieldName("type");
+    candidates.push({
+      node,
+      isString: type !== null && sourceText(type, source).replace(/\s+/g, "") === "string"
+    });
+  }
+  for (const node of descendants(root, "short_var_declaration")) {
+    if (node.startIndex >= use.startIndex || !visibleFromCallable(node, callable)) continue;
+    const names = declarationNames(node.childForFieldName("left"), source);
+    const index = names.indexOf(name2);
+    if (index < 0 || !scopeContains(node, use)) continue;
+    const value = expressionAt(node.childForFieldName("right"), index);
+    candidates.push({ node, isString: value !== null && expressionProvesString(value, source) });
+  }
+  for (const node of descendants(root, "range_clause")) {
+    if (node.startIndex >= use.startIndex || !visibleFromCallable(node, callable)) continue;
+    if (!sourceText(node, source).includes(":=")) continue;
+    if (!declarationNames(node.childForFieldName("left"), source).includes(name2)) continue;
+    if (scopeContains(node, use)) candidates.push({ node, isString: false });
+  }
+  candidates.sort((left, right) => right.node.startIndex - left.node.startIndex);
+  return candidates[0] ?? null;
+}
+function declarationNames(node, source) {
+  if (node === null) return [];
+  if (node.type === "identifier") return [sourceText(node, source)];
+  return node.namedChildren.filter((child) => child.type === "identifier").map((child) => sourceText(child, source));
+}
+function expressionAt(node, index) {
+  if (node === null) return null;
+  if (node.type !== "expression_list") return index === 0 ? node : null;
+  return node.namedChild(index);
+}
+function singleExpression(node) {
+  if (node === null) return null;
+  if (node.type === "expression_list") {
+    return node.namedChildCount === 1 ? node.namedChild(0) : null;
+  }
+  return node;
+}
+function assignmentOperator(node, source) {
+  const operator = node.children.find((child) => !child.isNamed && /^(?:\+=|=)$/.test(sourceText(child, source)));
+  return operator === void 0 ? "" : sourceText(operator, source);
+}
+function growsFromSameValue(expression, name2, source) {
+  const unwrapped = unwrapParentheses(expression);
+  if (unwrapped.type !== "binary_expression") return false;
+  const operator = unwrapped.children.find((child) => !child.isNamed)?.type;
+  if (operator !== "+") return false;
+  const left = unwrapped.childForFieldName("left");
+  return left !== null && leftmostOperand(left, source) === name2;
+}
+function leftmostOperand(node, source) {
+  let current = unwrapParentheses(node);
+  while (current.type === "binary_expression") {
+    const left = current.childForFieldName("left");
+    if (left === null) break;
+    current = unwrapParentheses(left);
+  }
+  return current.type === "identifier" ? sourceText(current, source) : "";
+}
+function expressionProvesString(expression, source) {
+  const unwrapped = unwrapParentheses(expression);
+  if (unwrapped.type === "interpreted_string_literal" || unwrapped.type === "raw_string_literal") return true;
+  if (descendants(unwrapped, "interpreted_string_literal").length > 0) return true;
+  if (descendants(unwrapped, "raw_string_literal").length > 0) return true;
+  if (unwrapped.type === "call_expression") {
+    const fn = unwrapped.childForFieldName("function");
+    return fn !== null && sourceText(fn, source).replace(/\s+/g, "") === "string";
+  }
+  return false;
+}
+function hasPerIterationReset(loop, assignment, name2, source) {
+  let current = assignment;
+  while (current.startIndex >= loop.startIndex && current.endIndex <= loop.endIndex) {
+    const statements = nearestAncestor(current, "statement_list");
+    if (statements === null || statements.startIndex < loop.startIndex) return false;
+    const candidateStatement = directChildContaining(statements, current);
+    if (candidateStatement === null) return false;
+    const siblings = statements.namedChildren;
+    const index = siblings.findIndex((statement) => sameNode(statement, candidateStatement));
+    if (index < 0) return false;
+    for (let candidate = 0; candidate < index; candidate += 1) {
+      if (directlyResets(siblings[candidate], name2, source)) return true;
+    }
+    if (sameNode(candidateStatement, assignment) && index + 1 < siblings.length && directlyResets(siblings[index + 1], name2, source)) return true;
+    const parent = statements.parent;
+    if (parent === null || sameNode(parent, loop.childForFieldName("body"))) return false;
+    current = parent;
+  }
+  return false;
+}
+function directlyResets(statement, name2, source) {
+  if (statement.type === "short_var_declaration") {
+    return declarationNames(statement.childForFieldName("left"), source).includes(name2);
+  }
+  if (statement.type === "var_declaration") {
+    return descendants(statement, "var_spec").some((spec) => declarationNames(spec.childForFieldName("name"), source).includes(name2));
+  }
+  if (statement.type !== "assignment_statement") return false;
+  const left = singleExpression(statement.childForFieldName("left"));
+  const right = singleExpression(statement.childForFieldName("right"));
+  if (left?.type !== "identifier" || sourceText(left, source) !== name2 || right === null) return false;
+  const operator = assignmentOperator(statement, source);
+  return operator === "=" && !growsFromSameValue(right, name2, source);
+}
+function directChildContaining(parent, descendant) {
+  return parent.namedChildren.find((child) => child.startIndex <= descendant.startIndex && child.endIndex >= descendant.endIndex) ?? null;
+}
+function isProvablySmallFixedLoop(loop, source) {
+  const control = loop.namedChildren.find((child) => child.type !== "block");
+  if (control === void 0) return false;
+  if (control.type === "range_clause") {
+    const right = control.childForFieldName("right");
+    if (right === null) return false;
+    if (right.type === "int_literal") return smallInteger(sourceText(right, source));
+    if (right.type === "composite_literal") {
+      const value = right.childForFieldName("body");
+      return value !== null && value.namedChildCount <= SMALL_FIXED_BOUND;
+    }
+    return false;
+  }
+  if (control.type !== "for_clause") return false;
+  const initializer = control.childForFieldName("initializer");
+  const condition = control.childForFieldName("condition");
+  const update = control.childForFieldName("update");
+  if (initializer?.type !== "short_var_declaration" || condition?.type !== "binary_expression" || update === null) {
+    return false;
+  }
+  const left = singleExpression(initializer.childForFieldName("left"));
+  const initial = singleExpression(initializer.childForFieldName("right"));
+  const conditionLeft = condition.childForFieldName("left");
+  const conditionRight = condition.childForFieldName("right");
+  if (left?.type !== "identifier" || initial?.type !== "int_literal" || conditionLeft?.type !== "identifier" || conditionRight?.type !== "int_literal") return false;
+  const variable = sourceText(left, source);
+  if (sourceText(conditionLeft, source) !== variable) return false;
+  const initialValue = Number(sourceText(initial, source).replaceAll("_", ""));
+  const boundValue = Number(sourceText(conditionRight, source).replaceAll("_", ""));
+  if (!Number.isInteger(initialValue) || !Number.isInteger(boundValue)) return false;
+  const conditionOperator = condition.children.find((child) => !child.isNamed)?.type;
+  const updateText = sourceText(update, source).replace(/\s+/g, "");
+  const step = updateText === `${variable}++` ? 1 : updateText === `${variable}--` ? -1 : signedUpdateStep(updateText, variable);
+  if (step === 0) return false;
+  let iterations;
+  if ((conditionOperator === "<" || conditionOperator === "<=") && step > 0) {
+    const distance = boundValue - initialValue + (conditionOperator === "<=" ? 1 : 0);
+    iterations = distance <= 0 ? 0 : Math.ceil(distance / step);
+  } else if ((conditionOperator === ">" || conditionOperator === ">=") && step < 0) {
+    const distance = initialValue - boundValue + (conditionOperator === ">=" ? 1 : 0);
+    iterations = distance <= 0 ? 0 : Math.ceil(distance / Math.abs(step));
+  } else {
+    return false;
+  }
+  return iterations <= SMALL_FIXED_BOUND;
+}
+function signedUpdateStep(text, variable) {
+  const escaped = variable.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = text.match(new RegExp(`^${escaped}([+-])=(\\d[\\d_]*)$`));
+  if (match?.[1] === void 0 || match[2] === void 0) return 0;
+  const magnitude = Number(match[2].replaceAll("_", ""));
+  if (!Number.isInteger(magnitude) || magnitude <= 0) return 0;
+  return match[1] === "+" ? magnitude : -magnitude;
+}
+function smallInteger(text) {
+  const value = Number(text.replaceAll("_", ""));
+  return Number.isInteger(value) && value >= 0 && value <= SMALL_FIXED_BOUND;
+}
+function scopeContains(declaration, use) {
+  const scope = lexicalScope(declaration);
+  return scope !== null && scope.startIndex <= use.startIndex && scope.endIndex >= use.endIndex;
+}
+function lexicalScope(node) {
+  let current = node.parent;
+  while (current !== null) {
+    if (current.type === "block" || current.type === "source_file" || current.type === "function_declaration" || current.type === "method_declaration" || current.type === "func_literal" || current.type === "for_statement") {
+      return current;
+    }
+    current = current.parent;
+  }
+  return null;
+}
+function nearestCallable(node) {
+  let current = node.parent;
+  while (current !== null) {
+    if (current.type === "function_declaration" || current.type === "method_declaration" || current.type === "func_literal") {
+      return current;
+    }
+    current = current.parent;
+  }
+  return null;
+}
+function visibleFromCallable(declaration, useCallable) {
+  const declarationCallable = nearestCallable(declaration);
+  if (declarationCallable !== null) return sameNode(declarationCallable, useCallable);
+  return lexicalScope(declaration)?.type === "source_file";
+}
+function sameNode(left, right) {
+  if (left === null || right === null) return left === right;
+  return left.type === right.type && left.startIndex === right.startIndex && left.endIndex === right.endIndex;
+}
+function nearestAncestor(node, type) {
+  let current = node.parent;
+  while (current !== null) {
+    if (current.type === type) return current;
+    current = current.parent;
+  }
+  return null;
+}
+function unwrapParentheses(node) {
+  let current = node;
+  while (current.type === "parenthesized_expression" && current.namedChildCount === 1) {
+    const child = current.namedChild(0);
+    if (child === null) break;
+    current = child;
+  }
+  return current;
+}
+
 // src/analyze.ts
 async function analyzeDiscovery(discovery) {
   const signals = [];
@@ -23099,6 +23334,9 @@ async function analyzeDiscovery(discovery) {
         try {
           if (tree.rootNode.hasError) throw new Error("Go source contains syntax errors");
           signals.push(...cacheElementFootprintSignals(file, tree.rootNode));
+          const stringSignals = stringConcatLoopSignals(file, tree.rootNode);
+          const previousStringSignals = file.previous === void 0 ? [] : await analyzePreviousStringConcats(file);
+          signals.push(...newChangedStringConcats(file, stringSignals, previousStringSignals));
         } finally {
           tree.delete();
         }
@@ -23126,6 +23364,36 @@ async function analyzeDiscovery(discovery) {
     positives: positives.sort(byLocation),
     parseErrors: parseErrors.sort((left, right) => left.path.localeCompare(right.path))
   };
+}
+async function analyzePreviousStringConcats(file) {
+  if (file.previous === void 0) return [];
+  const tree = await parseGo(file.previous);
+  try {
+    if (tree.rootNode.hasError) return [];
+    return stringConcatLoopSignals(
+      { path: file.path, current: file.previous, status: "repository", changedLines: /* @__PURE__ */ new Set() },
+      tree.rootNode
+    );
+  } finally {
+    tree.delete();
+  }
+}
+function newChangedStringConcats(file, current, previous) {
+  const previousCounts = /* @__PURE__ */ new Map();
+  for (const signal of previous) {
+    const key = String(signal.data.semanticKey ?? "");
+    previousCounts.set(key, (previousCounts.get(key) ?? 0) + 1);
+  }
+  return current.filter((signal) => {
+    const loopLine = Number(signal.data.loopLine);
+    const locallyChanged = changed(file, signal.line, signal.endLine) || Number.isInteger(loopLine) && file.changedLines.has(loopLine);
+    if (!locallyChanged) return false;
+    const key = String(signal.data.semanticKey ?? "");
+    const count = previousCounts.get(key) ?? 0;
+    if (count === 0) return true;
+    previousCounts.set(key, count - 1);
+    return false;
+  });
 }
 function cacheElementFootprintSignals(file, root) {
   const claims = cacheFootprintClaims(file, root);
@@ -23450,7 +23718,7 @@ function addPositives(ctx, analysis) {
 function createApp() {
   const app = new Adversary({
     name: domain.name,
-    version: "0.0.8",
+    version: "0.0.10",
     review: { maximumFindings: 8, minimumConfidence: "medium" }
   });
   app.rule(`${domain.name}.review`, async (ctx) => {
