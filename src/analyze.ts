@@ -1,5 +1,6 @@
 import { domain } from "./domain.js";
 import { descendants, parseGo, sourceText } from "./parser.js";
+import { environmentProcessInspectionSignals } from "./process-inspection.js";
 import { requestKeyedCacheSignals } from "./request-cache.js";
 import { stringConcatLoopSignals } from "./string-concat.js";
 import { type Analysis, type Discovery, type PositiveSignal, type Signal, type SourceRevision } from "./types.js";
@@ -39,6 +40,15 @@ export async function analyzeDiscovery(discovery: Discovery): Promise<Analysis> 
   } catch (error) {
     parseErrors.push({
       path: "<cross-file request-keyed cache analysis>",
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  try {
+    signals.push(...await environmentProcessInspectionSignals(discovery.files));
+  } catch (error) {
+    parseErrors.push({
+      path: "<cross-file environment process inspection analysis>",
       message: error instanceof Error ? error.message : String(error),
     });
   }

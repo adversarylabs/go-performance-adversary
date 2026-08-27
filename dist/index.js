@@ -3647,7 +3647,12 @@ var require_fast_uri = __commonJS({
     }
     function resolve3(baseURI, relativeURI, options) {
       const schemelessOptions = options ? Object.assign({ scheme: "null" }, options) : { scheme: "null" };
-      const resolved = resolveComponent(parse(baseURI, schemelessOptions), parse(relativeURI, schemelessOptions), schemelessOptions, true);
+      const { parsed: baseParsed, malformedAuthorityOrPort: baseMalformed } = parseWithStatus(baseURI, schemelessOptions);
+      const { parsed: relativeParsed, malformedAuthorityOrPort: relativeMalformed } = parseWithStatus(relativeURI, schemelessOptions);
+      if (baseMalformed || relativeMalformed) {
+        throw new Error(baseParsed.error || relativeParsed.error || "URI is malformed.");
+      }
+      const resolved = resolveComponent(baseParsed, relativeParsed, schemelessOptions, true);
       schemelessOptions.skipEscape = true;
       return serialize(resolved, schemelessOptions);
     }
@@ -3773,6 +3778,7 @@ var require_fast_uri = __commonJS({
     }
     var URI_PARSE = /^(?:([^#/:?]+):)?(?:\/\/((?:([^#/?@]*)@)?(\[[^#/?\]]+\]|[^#/:?]*)(?::(\d*))?))?([^#?]*)(?:\?([^#]*))?(?:#((?:.|[\n\r])*))?/u;
     var AUTHORITY_PREFIX = /^(?:[^#/:?]+:)?\/\/([^/?#]*)/;
+    var AUTHORITY_INTRODUCER_REGION = /^(?:[^#/:?]+:)?([/\\\t\n\r]*)/;
     function getParseError(parsed, matches) {
       if (matches[2] !== void 0 && parsed.path && parsed.path[0] !== "/") {
         return 'URI path must start with "/" when authority is present.';
@@ -3806,6 +3812,20 @@ var require_fast_uri = __commonJS({
       if (authorityMatch !== null && authorityMatch[1].indexOf("\\") !== -1) {
         parsed.error = "URI authority must not contain a literal backslash.";
         malformedAuthorityOrPort = true;
+      }
+      const introducerMatch = uri.match(AUTHORITY_INTRODUCER_REGION);
+      if (introducerMatch !== null) {
+        const region = introducerMatch[1];
+        const normalizedRegion = region.replace(/[\t\n\r]/g, "");
+        if (normalizedRegion.length >= 2) {
+          if (normalizedRegion.slice(0, 2) !== "//") {
+            parsed.error = parsed.error || "URI authority must not contain a literal backslash.";
+            malformedAuthorityOrPort = true;
+          } else if (region.length !== normalizedRegion.length) {
+            parsed.error = parsed.error || "URI authority introducer must not contain whitespace.";
+            malformedAuthorityOrPort = true;
+          }
+        }
       }
       const matches = uri.match(URI_PARSE);
       if (matches) {
@@ -17147,6 +17167,17 @@ var domain = {
       whyItMatters: "An attacker can vary a cookie, header, query, or path value to force distinct cache misses, material backend work, and long-lived entries; a TTL limits age, not the number admitted during that window.",
       impact: "Request volume is amplified into remote/file/database work and memory growth across the process.",
       recommendation: "Use a cache with a hard entry/weight limit and eviction, or constrain/admit request keys before doing the miss work."
+    },
+    {
+      id: "go-perf.environment-process-inspection-per-request",
+      title: "Environment-specific process inspection runs on every request",
+      category: "performance",
+      severity: "medium",
+      confidence: "high",
+      summary: (count) => `${count} request path${count === 1 ? "" : "s"} repeatedly inspect process metadata without applicability gating or a bounded cache.`,
+      whyItMatters: "Process and container identity inspection can read procfs and parse cgroup state; doing that per RPC adds system calls and parsing even on nodes where the environment-specific identity cannot exist.",
+      impact: "Every configured request pays avoidable filesystem and parsing latency, multiplied by request rate.",
+      recommendation: "Gate the resolver once when the target environment is absent and cache successful or empty process-ID lookups for a bounded interval."
     }
   ],
   noRiskSummary: "No material defer-in-loop, per-request client, repeated compilation, or quadratic string building was found.",
@@ -21397,8 +21428,415 @@ function sourceText(node, source) {
   return source.slice(node.startIndex, node.endIndex);
 }
 
+// src/process-inspection.ts
+import { dirname as dirname3 } from "node:path";
+var RULE_ID = "go-perf.environment-process-inspection-per-request";
+var PROCESS_INSPECTION = /^(?:GetContainerIDByProcess|GetContainerIDForPID|GetPodUIDAndContainerID|ContainerIDByProcess|ReadProcessCgroup|ReadCgroup|ProcessCgroup)$/;
+var RESOLVER_METHOD = /^(?:Get|Resolve|Lookup).*(?:PodUID|ContainerID|ProcessIdentity|WorkloadID)$/;
+var HOT_METHOD = /^(?:ServeHTTP|Handle|Preprocess|Invoke|Intercept|Process|Fetch\w*|Stream\w*)$/;
+async function environmentProcessInspectionSignals(files) {
+  const current = await rawFindings(files);
+  const previousFiles = previousRevisions(files);
+  const comparePrevious = files.some((file) => file.status === "modified" && file.previous !== void 0);
+  const previous = !comparePrevious || previousFiles.length === 0 ? [] : await rawFindings(previousFiles);
+  const previousFingerprints = new Set(previous.map((finding) => finding.fingerprint));
+  return current.flatMap((finding) => {
+    if (previousFingerprints.has(finding.fingerprint)) return [];
+    const anchor = changedAnchor(files, finding);
+    if (anchor === void 0) return [];
+    return [{
+      ruleId: RULE_ID,
+      path: anchor.path,
+      line: anchor.line,
+      ...anchor.endLine === anchor.line ? {} : { endLine: anchor.endLine },
+      message: `${finding.hot.name} reaches ${finding.inspectionCall.member} for each request through ${finding.resolverCall.member}, without a construction-time environment gate or bounded process-ID cache.`,
+      snippet: anchor.snippet,
+      data: {
+        hotPath: finding.hot.name,
+        resolverMethod: finding.resolverCall.member,
+        inspectionOperation: finding.inspectionCall.member,
+        constructor: finding.constructor.name,
+        semanticFingerprint: finding.fingerprint
+      }
+    }];
+  });
+}
+async function rawFindings(files) {
+  const goFiles = files.filter((file) => file.path.endsWith(".go") && !file.path.endsWith("_test.go") && !/(?:^|\/)(?:vendor|testdata|generated)(?:\/|$)/.test(file.path));
+  const program = await collectProgram(goFiles);
+  const findings = [];
+  for (const implementation of program.functions) {
+    if (implementation.receiverType === void 0 || !RESOLVER_METHOD.test(implementation.name)) continue;
+    const pid = [...implementation.params].find(([, type]) => /^(?:u?int(?:32|64)?|pid_t)$/.test(compact(type)));
+    if (pid === void 0) continue;
+    const inspectionCall = implementation.calls.find((call) => call.executable && PROCESS_INSPECTION.test(call.member) && expressionUsesName(call.args.join(","), pid[0]) && receiverStartsWith(call.receiver, implementation.receiverName) && bindingUnshadowed(implementation, implementation.receiverName, call.start));
+    if (inspectionCall === void 0) continue;
+    if (!inspectionReceiverIsProcessField(implementation, inspectionCall, program)) continue;
+    if (hasBoundedProcessCache(implementation, inspectionCall, pid[0])) continue;
+    const constructors = program.functions.filter((candidate) => candidate.receiverType === void 0 && /^(?:new|build|make).*(?:resolver|identity)/i.test(candidate.name) && candidate.constructedTypes.has(implementation.receiverType));
+    for (const constructor of constructors) {
+      if (hasEnvironmentGate(constructor, program.imports.get(constructor.file.path), implementation.receiverType)) continue;
+      if (returnsCachedResolver(constructor, implementation, program.functions)) continue;
+      for (const helper of program.functions) {
+        if (helper.packageKey !== implementation.packageKey || helper.receiverType === void 0) continue;
+        const resolverCall = helper.calls.find((call) => call.executable && call.member === implementation.name && call.args.length > 0 && /(?:^|\.)(?:PID|Pid|ProcessID)$/.test(compact(call.args[0] ?? "")) && receiverStartsWith(call.receiver, helper.receiverName) && bindingUnshadowed(helper, helper.receiverName, call.start));
+        if (resolverCall === void 0) continue;
+        const hot = hotCallerOf(helper, program.functions, program.imports);
+        if (hot === void 0) continue;
+        const wiring = program.functions.find((candidate) => candidate.packageKey === helper.packageKey && candidate.constructedTypes.has(helper.receiverType) && candidate.calls.some((call) => call.executable && call.receiver === "" && call.member === constructor.name && bindingUnshadowed(candidate, constructor.name, call.start)));
+        if (wiring === void 0) continue;
+        const fingerprint = [
+          helper.packageKey,
+          hot.receiverType ?? "",
+          hot.name,
+          helper.name,
+          implementation.receiverType,
+          implementation.name,
+          inspectionCall.member,
+          constructor.name,
+          wiring.name
+        ].join("|");
+        findings.push({
+          fingerprint,
+          hot,
+          helper,
+          implementation,
+          constructor,
+          wiring,
+          resolverCall,
+          inspectionCall
+        });
+      }
+    }
+  }
+  return deduplicate(findings);
+}
+async function collectProgram(files) {
+  const functions = [];
+  const imports = /* @__PURE__ */ new Map();
+  const fields = /* @__PURE__ */ new Map();
+  for (const file of files) {
+    const tree = await parseGo(file.current);
+    try {
+      if (tree.rootNode.hasError) throw new Error(`Go source contains syntax errors: ${file.path}`);
+      const packageNode = tree.rootNode.namedChildren.find((node) => node.type === "package_clause");
+      const packageName = packageNode === void 0 ? "" : sourceText(packageNode, file.current).replace(/^package\s+/, "").trim();
+      const packageKey = `${dirname3(file.path)}:${packageName}`;
+      imports.set(file.path, importAliases(tree.rootNode, file.current));
+      for (const typeSpec of descendants(tree.rootNode, "type_spec")) {
+        const typeNameNode = typeSpec.childForFieldName("name");
+        const typeNode = typeSpec.childForFieldName("type");
+        if (typeNameNode === null || typeNode?.type !== "struct_type") continue;
+        const typeName = sourceText(typeNameNode, file.current);
+        for (const field of descendants(typeNode, "field_declaration")) {
+          const fieldTypeNode = field.childForFieldName("type");
+          const fieldNameNode = field.childForFieldName("name");
+          if (fieldTypeNode === null || fieldNameNode === null) continue;
+          fields.set(
+            `${packageKey}|${typeName}|${sourceText(fieldNameNode, file.current)}`,
+            compact(sourceText(fieldTypeNode, file.current))
+          );
+        }
+      }
+      for (const node of [
+        ...descendants(tree.rootNode, "function_declaration"),
+        ...descendants(tree.rootNode, "method_declaration")
+      ]) {
+        const nameNode = node.childForFieldName("name");
+        const body2 = node.childForFieldName("body");
+        if (nameNode === null || body2 === null) continue;
+        const receiver = node.childForFieldName("receiver");
+        const receiverInfo = receiver === null ? {} : receiverBinding(receiver, file.current);
+        const params = parameterBindings(node.childForFieldName("parameters"), file.current);
+        const calls = descendants(body2, "call_expression").flatMap((call) => {
+          if (!directlyOwned(call, body2)) return [];
+          const fn = call.childForFieldName("function");
+          const args2 = call.childForFieldName("arguments");
+          if (fn === null || args2 === null) return [];
+          let receiver2 = "";
+          let member = "";
+          if (fn.type === "selector_expression") {
+            const operand = fn.childForFieldName("operand");
+            const field = fn.childForFieldName("field");
+            if (operand === null || field === null) return [];
+            receiver2 = sourceText(operand, file.current);
+            member = sourceText(field, file.current);
+          } else if (fn.type === "identifier") {
+            member = sourceText(fn, file.current);
+          } else {
+            return [];
+          }
+          return [{
+            receiver: receiver2,
+            member,
+            args: args2.namedChildren.map((arg) => sourceText(arg, file.current)),
+            line: call.startPosition.row + 1,
+            endLine: call.endPosition.row + 1,
+            start: call.startIndex,
+            text: sourceText(call, file.current),
+            executable: !staticallyDead(call, file.current),
+            topLevelNilGate: topLevelNilGate(call, file.current)
+          }];
+        });
+        functions.push({
+          file,
+          packageKey,
+          name: sourceText(nameNode, file.current),
+          ...receiverInfo,
+          params,
+          text: sourceText(node, file.current),
+          start: node.startIndex,
+          end: node.endIndex,
+          line: node.startPosition.row + 1,
+          endLine: node.endPosition.row + 1,
+          calls,
+          identifiers: new Set([
+            ...descendants(body2, "identifier"),
+            ...descendants(body2, "field_identifier")
+          ].filter((identifier) => directlyOwned(identifier, body2)).map((identifier) => sourceText(identifier, file.current))),
+          constructedTypes: new Set(descendants(body2, "composite_literal").flatMap((literal) => {
+            if (!directlyOwned(literal, body2)) return [];
+            const type = literal.childForFieldName("type");
+            if (type === null) return [];
+            return [compact(sourceText(type, file.current)).replace(/^\*/, "")];
+          }))
+        });
+      }
+    } finally {
+      tree.delete();
+    }
+  }
+  return { functions, imports, fields };
+}
+function hotCallerOf(helper, functions, imports) {
+  if (isHotEntry(helper, imports.get(helper.file.path))) return helper;
+  return functions.find((candidate) => candidate.packageKey === helper.packageKey && candidate.receiverType === helper.receiverType && isHotEntry(candidate, imports.get(candidate.file.path)) && candidate.calls.some((call) => call.executable && call.member === helper.name && compact(call.receiver) === compact(candidate.receiverName ?? "") && bindingUnshadowed(candidate, candidate.receiverName, call.start)));
+}
+function hasEnvironmentGate(fn, imports, implementationType) {
+  const osAliases = new Set(
+    [...imports ?? /* @__PURE__ */ new Map()].filter(([, path]) => path === "os").map(([alias]) => alias)
+  );
+  const environmentCalls = fn.calls.filter((call) => call.executable && osAliases.has(compact(call.receiver)) && /^(?:Getenv|LookupEnv)$/.test(call.member) && call.args.some((arg) => /(?:KUBERNETES|K8S|CONTAINER|CLOUD|PLATFORM|ENVIRONMENT)/i.test(arg)) && call.topLevelNilGate && bindingUnshadowed(fn, compact(call.receiver), call.start) && call.start < firstTypeConstruction(fn, implementationType));
+  return environmentCalls.length > 0;
+}
+function returnsCachedResolver(constructor, implementation, functions) {
+  return functions.some((wrapper) => {
+    if (wrapper.packageKey !== implementation.packageKey || wrapper.name !== implementation.name) return false;
+    if (wrapper.receiverType === implementation.receiverType || wrapper.receiverType === void 0) return false;
+    if (!constructor.constructedTypes.has(wrapper.receiverType)) return false;
+    const pid = [...wrapper.params].find(([, type]) => /^(?:u?int(?:32|64)?|pid_t)$/.test(compact(type)));
+    if (pid === void 0) return false;
+    const delegate = wrapper.calls.find((call) => call.member === implementation.name);
+    return delegate !== void 0 && delegate.args.some((arg) => expressionUsesName(arg, pid[0])) && hasBoundedProcessCache(wrapper, delegate, pid[0]);
+  });
+}
+function hasBoundedProcessCache(fn, work, pidName) {
+  const read = fn.calls.find((call) => call.executable && /^(?:Load|Get|Lookup)$/.test(call.member) && call.args.some((arg) => expressionUsesName(arg, pidName)) && call.start < work.start);
+  const write = fn.calls.find((call) => call.executable && /^(?:Store|Set|Add)$/.test(call.member) && call.args.some((arg) => expressionUsesName(arg, pidName)) && call.start > work.start);
+  if (read === void 0 || write === void 0) return false;
+  const bounded = [...fn.identifiers].some((identifier) => /^(?:ttl|expiresAt|expiration|expires)$/i.test(identifier));
+  const hitReturnBeforeWork = /\breturn\b/.test(fn.file.current.slice(read.start, work.start));
+  return bounded && hitReturnBeforeWork;
+}
+function isHotEntry(fn, imports) {
+  if (!HOT_METHOD.test(fn.name)) return false;
+  const aliases = imports ?? /* @__PURE__ */ new Map();
+  const contextAliases = new Set([...aliases].filter(([, path]) => path === "context").map(([alias]) => alias));
+  const httpAliases = new Set([...aliases].filter(([, path]) => path === "net/http").map(([alias]) => alias));
+  const types = [...fn.params.values()].map(compact);
+  if (fn.name === "ServeHTTP") {
+    return types.some((type) => [...httpAliases].some((alias) => type === `${alias}.ResponseWriter`)) && types.some((type) => [...httpAliases].some((alias) => type === `*${alias}.Request`));
+  }
+  return types.some((type) => [...contextAliases].some((alias) => type === `${alias}.Context`));
+}
+function inspectionReceiverIsProcessField(fn, call, program) {
+  if (fn.receiverName === void 0 || fn.receiverType === void 0) return false;
+  const match = compact(call.receiver).match(new RegExp(`^${escapeRegExp(fn.receiverName)}\\.([A-Za-z_]\\w*)$`));
+  const fieldName = match?.[1];
+  if (fieldName === void 0) return false;
+  const fieldType = program.fields.get(`${fn.packageKey}|${fn.receiverType}|${fieldName}`);
+  if (fieldType === void 0) return false;
+  const alias = fieldType.match(/^([A-Za-z_]\w*)\./)?.[1];
+  if (alias === void 0) return false;
+  const path = program.imports.get(fn.file.path)?.get(alias);
+  return path !== void 0 && /(?:^|\/)(?:containerinfo|container|procfs|cgroup)(?:\/|$)/i.test(path);
+}
+function changedAnchor(files, finding) {
+  const repositoryMode = files.every((file) => file.status === "repository");
+  const candidates = [
+    { file: finding.helper.file, line: finding.resolverCall.line, endLine: finding.resolverCall.endLine, text: finding.resolverCall.text },
+    { file: finding.implementation.file, line: finding.inspectionCall.line, endLine: finding.inspectionCall.endLine, text: finding.inspectionCall.text },
+    { file: finding.constructor.file, line: finding.constructor.line, endLine: finding.constructor.endLine, text: firstLine(finding.constructor.text) },
+    { file: finding.wiring.file, line: finding.wiring.line, endLine: finding.wiring.endLine, text: firstLine(finding.wiring.text) },
+    { file: finding.hot.file, line: finding.hot.line, endLine: finding.hot.endLine, text: firstLine(finding.hot.text) }
+  ];
+  for (const candidate of candidates) {
+    const revision = files.find((file) => file.path === candidate.file.path);
+    if (revision === void 0) continue;
+    if (repositoryMode && revision.status === "repository" || revision.status === "added") {
+      return { path: revision.path, line: candidate.line, endLine: candidate.endLine, snippet: candidate.text.trim().slice(0, 300) };
+    }
+    for (let line = candidate.line; line <= candidate.endLine; line += 1) {
+      if (revision.changedLines.has(line)) {
+        return { path: revision.path, line, endLine: line, snippet: candidate.text.trim().slice(0, 300) };
+      }
+    }
+  }
+  for (const file of files) {
+    if (file.status !== "modified" || file.deletionAnchors === void 0) continue;
+    const line = [...file.deletionAnchors].sort((left, right) => left - right)[0];
+    if (line !== void 0 && [finding.constructor.file.path, finding.implementation.file.path, finding.helper.file.path, finding.wiring.file.path].includes(file.path)) {
+      return { path: file.path, line, endLine: line, snippet: lineText(file.current, line) };
+    }
+  }
+  return void 0;
+}
+function previousRevisions(files) {
+  return files.flatMap((file) => {
+    if (file.status === "added") return [];
+    const { previous, deletionAnchors: _deletionAnchors, ...revision } = file;
+    if (file.status === "modified") {
+      if (previous === void 0) return [];
+      return [{ ...revision, current: previous, status: "repository", changedLines: /* @__PURE__ */ new Set() }];
+    }
+    return [{ ...revision, status: "repository", changedLines: /* @__PURE__ */ new Set() }];
+  });
+}
+function importAliases(root, source) {
+  const aliases = /* @__PURE__ */ new Map();
+  for (const spec of descendants(root, "import_spec")) {
+    const pathNode = spec.childForFieldName("path");
+    if (pathNode === null) continue;
+    const path = sourceText(pathNode, source).replace(/^"|"$/g, "");
+    const nameNode = spec.childForFieldName("name");
+    const alias = nameNode === null ? path.split("/").pop() ?? "" : sourceText(nameNode, source);
+    if (alias !== "_" && alias !== ".") aliases.set(alias, path);
+  }
+  return aliases;
+}
+function receiverBinding(node, source) {
+  const text = sourceText(node, source).replace(/^\(|\)$/g, "").trim();
+  const match = text.match(/^([A-Za-z_]\w*)\s+\*?([A-Za-z_]\w*)$/);
+  const receiverName = match?.[1];
+  const receiverType = match?.[2];
+  return receiverName === void 0 || receiverType === void 0 ? {} : { receiverName, receiverType };
+}
+function parameterBindings(node, source) {
+  const result = /* @__PURE__ */ new Map();
+  if (node === null) return result;
+  for (const declaration of descendants(node, "parameter_declaration")) {
+    const typeNode = declaration.childForFieldName("type");
+    if (typeNode === null) continue;
+    const type = sourceText(typeNode, source);
+    for (const nameNode of declaration.namedChildren.filter((child) => child.type === "identifier")) {
+      result.set(sourceText(nameNode, source), type);
+    }
+  }
+  return result;
+}
+function staticallyDead(node, source) {
+  let current = node;
+  while (current?.parent !== null && current?.parent !== void 0) {
+    const parent = current.parent;
+    if (parent.type === "statement_list") {
+      const statement = parent.namedChildren.find((child) => contains(child, node));
+      if (statement !== void 0) {
+        const index = parent.namedChildren.indexOf(statement);
+        if (parent.namedChildren.slice(0, index).some((sibling) => sibling.type === "return_statement")) {
+          return true;
+        }
+      }
+    }
+    if (parent.type === "if_statement") {
+      const condition = parent.childForFieldName("condition");
+      const consequence = parent.childForFieldName("consequence");
+      const alternative = parent.childForFieldName("alternative");
+      const value = condition === null ? "" : compact(sourceText(condition, source));
+      if (value === "false" && consequence !== null && contains(consequence, node)) return true;
+      if (value === "true" && alternative !== null && contains(alternative, node)) return true;
+    }
+    current = parent;
+    if (parent.type === "function_declaration" || parent.type === "method_declaration") break;
+  }
+  return false;
+}
+function directlyOwned(node, body2) {
+  let current = node;
+  while (current !== null && current.id !== body2.id) {
+    if (current.type === "func_literal") return false;
+    current = current.parent;
+  }
+  return current !== null;
+}
+function topLevelNilGate(node, source) {
+  let current = node;
+  while (current?.parent !== null && current?.parent !== void 0) {
+    const parent = current.parent;
+    if (parent.type === "if_statement") {
+      const condition = parent.childForFieldName("condition");
+      const consequence = parent.childForFieldName("consequence");
+      const initializer = parent.childForFieldName("initializer");
+      if (condition === null || consequence === null) return false;
+      const conditionText = compact(sourceText(condition, source));
+      const callText = compact(sourceText(node, source));
+      const directGetenv = contains(condition, node) && (conditionText === `${callText}==""` || conditionText === `""==${callText}`);
+      const lookupInitializer = initializer !== null && contains(initializer, node) ? compact(sourceText(initializer, source)).match(/^(?:[A-Za-z_]\w*|_),([A-Za-z_]\w*):=(.+)$/) : null;
+      const lookupEnv = lookupInitializer !== null && lookupInitializer[2]?.includes(callText) === true && conditionText === `!${lookupInitializer[1]}`;
+      if (!directGetenv && !lookupEnv) return false;
+      if (!/\breturn\s+nil\b/.test(sourceText(consequence, source))) return false;
+      const statements = parent.parent;
+      const block = statements?.type === "statement_list" ? statements.parent : statements;
+      return block?.type === "block" && (block.parent?.type === "function_declaration" || block.parent?.type === "method_declaration");
+    }
+    current = parent;
+    if (parent.type === "function_declaration" || parent.type === "method_declaration") break;
+  }
+  return false;
+}
+function contains(outer, inner) {
+  return outer.startIndex <= inner.startIndex && outer.endIndex >= inner.endIndex;
+}
+function receiverStartsWith(receiver, name2) {
+  if (name2 === void 0) return false;
+  const value = compact(receiver);
+  return value === name2 || value.startsWith(`${name2}.`);
+}
+function bindingUnshadowed(fn, name2, before) {
+  if (name2 === void 0) return false;
+  if (fn.params.has(name2)) return false;
+  const prefix = fn.file.current.slice(fn.start, before);
+  return !new RegExp(`(?:^|[;{}\\n])\\s*(?:var\\s+${escapeRegExp(name2)}\\b|${escapeRegExp(name2)}\\s*:=)`).test(prefix);
+}
+function deduplicate(findings) {
+  const seen = /* @__PURE__ */ new Set();
+  return findings.filter((finding) => {
+    if (seen.has(finding.fingerprint)) return false;
+    seen.add(finding.fingerprint);
+    return true;
+  });
+}
+function expressionUsesName(expression, name2) {
+  return new RegExp(`(?:^|[^A-Za-z0-9_])${escapeRegExp(name2)}(?:[^A-Za-z0-9_]|$)`).test(expression);
+}
+function firstTypeConstruction(fn, type) {
+  const match = new RegExp(`(?:&\\s*)?${escapeRegExp(type)}\\s*\\{`).exec(fn.file.current.slice(fn.start, fn.end));
+  return match?.index === void 0 ? Number.POSITIVE_INFINITY : fn.start + match.index;
+}
+function compact(value) {
+  return value.replace(/\s+/g, "").replace(/^\((.*)\)$/s, "$1");
+}
+function firstLine(value) {
+  return value.split("\n")[0]?.trim().slice(0, 300) ?? "";
+}
+function lineText(source, line) {
+  return source.split("\n")[line - 1]?.trim().slice(0, 300) ?? "";
+}
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 // src/request-cache.ts
-var RULE_ID = "go-perf.request-keyed-cache-amplification";
+var RULE_ID2 = "go-perf.request-keyed-cache-amplification";
 async function requestKeyedCacheSignals(files) {
   const previousFiles = files.flatMap((file) => {
     if (file.status === "added") return [];
@@ -21519,7 +21957,7 @@ async function currentRequestKeyedCacheSignals(files) {
         ...requestPath.map((edge) => `${edge.caller.path}:${edge.caller.name}:${semanticCode(edge.call.text)}`)
       ].join("|");
       signals.push({
-        ruleId: RULE_ID,
+        ruleId: RULE_ID2,
         path: anchor.path,
         line: changedLine,
         message: `A request-controlled key reaches ${insertion.cacheText}, whose miss path performs ${material.name} before inserting into a long-lived cache without a proven entry/weight bound or eviction.` + (scanUnderLock ? " The same cache is also scanned under a lock, multiplying per-request work as it grows." : ""),
@@ -21539,7 +21977,7 @@ async function currentRequestKeyedCacheSignals(files) {
       });
     }
   }
-  return deduplicate(signals);
+  return deduplicate2(signals);
 }
 function semanticCode(source) {
   return maskGoNonCode(source, false).replace(/\s+/g, "");
@@ -21566,11 +22004,11 @@ async function collectProgramFacts(files) {
       }
       collectFiniteConstants(file, tree.rootNode, finiteConstants, scope);
       collectPersistentCaches(file, tree.rootNode, caches, receiverMapFields, scope);
-      const aliases = importAliases(file.current, tree.rootNode, "net/http", "http");
-      const sqlAliases = importAliases(file.current, tree.rootNode, "database/sql", "sql");
+      const aliases = importAliases2(file.current, tree.rootNode, "net/http", "http");
+      const sqlAliases = importAliases2(file.current, tree.rootNode, "database/sql", "sql");
       const fileAliases = /* @__PURE__ */ new Set([
-        ...importAliases(file.current, tree.rootNode, "os", "os"),
-        ...importAliases(file.current, tree.rootNode, "io/fs", "fs")
+        ...importAliases2(file.current, tree.rootNode, "os", "os"),
+        ...importAliases2(file.current, tree.rootNode, "io/fs", "fs")
       ]);
       for (const node of [
         ...descendants(tree.rootNode, "function_declaration"),
@@ -21999,17 +22437,17 @@ function callbackIsSynchronouslyExecuted(call, literal, source) {
   if (selected === void 0) return false;
   let root = call;
   while (root.parent !== null) root = root.parent;
-  const aliases = importAliases(source, root, "golang.org/x/sync/singleflight", "singleflight");
+  const aliases = importAliases2(source, root, "golang.org/x/sync/singleflight", "singleflight");
   if (aliases.size === 0) return false;
   return descendants(root, "var_spec").some((spec) => {
     let owner = spec.parent;
     while (owner !== null && owner.type !== "source_file" && !["function_declaration", "method_declaration", "func_literal"].includes(owner.type)) owner = owner.parent;
     if (owner?.type !== "source_file") return false;
     if (!declaredNames(spec, source).includes(selected)) return false;
-    const compact = sourceText(spec, source).replace(/\s+/g, "");
+    const compact2 = sourceText(spec, source).replace(/\s+/g, "");
     return [...aliases].some((alias) => new RegExp(
-      `^${escapeRegExp(selected)}(?:\\*?${escapeRegExp(alias)}\\.Group|=(?:&)?${escapeRegExp(alias)}\\.Group\\{)`
-    ).test(compact));
+      `^${escapeRegExp2(selected)}(?:\\*?${escapeRegExp2(alias)}\\.Group|=(?:&)?${escapeRegExp2(alias)}\\.Group\\{)`
+    ).test(compact2));
   });
 }
 function localFunctionLiteralDefinitelyInvoked(literal) {
@@ -22109,9 +22547,9 @@ function commaOkGuard(value, source) {
   const condition = guard.childForFieldName("condition");
   const consequence = guard.childForFieldName("consequence");
   if (condition === null || consequence === null) return void 0;
-  const compact = sourceText(condition, source).replace(/\s+/g, "").replace(/^\((.*)\)$/, "$1");
-  if (compact === ok && blockTerminates(consequence, source)) return { kind: "hit" };
-  if (compact === `!${ok}`) {
+  const compact2 = sourceText(condition, source).replace(/\s+/g, "").replace(/^\((.*)\)$/, "$1");
+  if (compact2 === ok && blockTerminates(consequence, source)) return { kind: "hit" };
+  if (compact2 === `!${ok}`) {
     return { kind: "miss", branch: { start: consequence.startIndex, end: consequence.endIndex } };
   }
   return void 0;
@@ -22512,7 +22950,7 @@ function valueIdentity(expression, environment) {
     const origins = [...dependencies].filter((dependency) => dependency.startsWith("origin:")).sort();
     const identity = values.length > 0 ? values : parameters2.length > 0 ? parameters2 : origins;
     if (identity.length === 0) continue;
-    canonical = canonical.replace(new RegExp(`\\b${escapeRegExp(identifier)}\\b`, "g"), `{${identity.join("|")}}`);
+    canonical = canonical.replace(new RegExp(`\\b${escapeRegExp2(identifier)}\\b`, "g"), `{${identity.join("|")}}`);
   }
   return `value:canonical:${canonical}`;
 }
@@ -22521,7 +22959,7 @@ function expressionDependencies(expression, env, byName, summaries) {
   const deps = /* @__PURE__ */ new Set();
   const requestReceivers = [...env].filter(([, value]) => value.has("request-object")).map(([name2]) => name2);
   for (const receiver of requestReceivers) {
-    const escaped = escapeRegExp(receiver);
+    const escaped = escapeRegExp2(receiver);
     const sourcePattern = new RegExp(
       `\\b${escaped}(?:\\.(?:Cookie|PathValue)\\s*\\([^)]*\\)|\\.Header\\.Get\\s*\\([^)]*\\)|\\.URL\\.Query\\s*\\(\\s*\\)\\.Get\\s*\\([^)]*\\)|\\.(?:Header|URL\\.Query\\s*\\(\\s*\\))\\s*\\[[^\\]]+\\]|\\.URL\\.(?:Path|RawPath))`,
       "g"
@@ -22668,7 +23106,7 @@ function findMaterialWork(fn, insertion, lookup, keyOrigins, seeds, byName, summ
   });
 }
 function materialFeedsInsertion(fn, call, insertion) {
-  if (call.start >= insertion.start && call.start < insertion.end && new RegExp(`\\b${escapeRegExp(call.functionText)}\\s*\\(`).test(maskGoNonCode(insertion.value))) return true;
+  if (call.start >= insertion.start && call.start < insertion.end && new RegExp(`\\b${escapeRegExp2(call.functionText)}\\s*\\(`).test(maskGoNonCode(insertion.value))) return true;
   const values = /* @__PURE__ */ new Map();
   const ancestors = scopeAncestors(fn.scopes, insertion.scopeId);
   const assignments = fn.assignments.filter((item) => item.line >= call.line && item.start < insertion.start && (ancestors.includes(item.scopeId) || !item.declaration && !item.terminatesBranch && callableScope(fn.scopes, item.scopeId) === callableScope(fn.scopes, insertion.scopeId))).sort((left, right) => left.start - right.start);
@@ -22713,18 +23151,18 @@ function materialFeedsInsertion(fn, call, insertion) {
           return;
         }
         const executable = maskGoNonCode(expression);
-        const direct = call.start >= assignment.start && call.start < assignment.end && new RegExp(`\\b${escapeRegExp(call.functionText)}\\s*\\(`).test(executable);
-        const derived = [...values].some(([name2, contains]) => contains && new RegExp(`\\b${escapeRegExp(name2)}\\b`).test(executable));
+        const direct = call.start >= assignment.start && call.start < assignment.end && new RegExp(`\\b${escapeRegExp2(call.functionText)}\\s*\\(`).test(executable);
+        const derived = [...values].some(([name2, contains2]) => contains2 && new RegExp(`\\b${escapeRegExp2(name2)}\\b`).test(executable));
         next.set(target, direct || derived);
       });
       const conditional = !ancestors.includes(assignment.scopeId) && conditionallyExecutedRelativeTo(fn.scopes, assignment.scopeId, insertion.scopeId);
-      for (const [target, contains] of next) {
-        values.set(target, conditional ? (values.get(target) ?? false) || contains : contains);
+      for (const [target, contains2] of next) {
+        values.set(target, conditional ? (values.get(target) ?? false) || contains2 : contains2);
       }
     }
   }
   const insertionValue = maskGoNonCode(insertion.value);
-  return [...values].some(([name2, contains]) => contains && new RegExp(`\\b${escapeRegExp(name2)}\\b`).test(insertionValue));
+  return [...values].some(([name2, contains2]) => contains2 && new RegExp(`\\b${escapeRegExp2(name2)}\\b`).test(insertionValue));
 }
 function replayMaterialAssignments(assignments, base, call) {
   const values = new Map(base);
@@ -22738,11 +23176,11 @@ function replayMaterialAssignments(assignments, base, call) {
         return;
       }
       const executable = maskGoNonCode(expression);
-      const direct = call.start >= assignment.start && call.start < assignment.end && new RegExp(`\\b${escapeRegExp(call.functionText)}\\s*\\(`).test(executable);
-      const derived = [...values].some(([name2, contains]) => contains && new RegExp(`\\b${escapeRegExp(name2)}\\b`).test(executable));
+      const direct = call.start >= assignment.start && call.start < assignment.end && new RegExp(`\\b${escapeRegExp2(call.functionText)}\\s*\\(`).test(executable);
+      const derived = [...values].some(([name2, contains2]) => contains2 && new RegExp(`\\b${escapeRegExp2(name2)}\\b`).test(executable));
       next.set(target, direct || derived);
     });
-    for (const [target, contains] of next) values.set(target, contains);
+    for (const [target, contains2] of next) values.set(target, contains2);
   }
   return values;
 }
@@ -22807,9 +23245,9 @@ function receiverCacheIsProvenRequestLocal(fn, cacheId, requestPath) {
     const index = latest.targets.indexOf(receiver);
     const value = latest.expressions[index] ?? (index === 0 ? latest.expressions[0] : void 0);
     if (value === void 0) return false;
-    const compact = value.replace(/\s+/g, "");
-    const type = escapeRegExp(receiverType);
-    return new RegExp(`^(?:&?${type}\\{|new\\(${type}\\))`).test(compact);
+    const compact2 = value.replace(/\s+/g, "");
+    const type = escapeRegExp2(receiverType);
+    return new RegExp(`^(?:&?${type}\\{|new\\(${type}\\))`).test(compact2);
   });
 }
 function hasFiniteAdmission(scopes, keyOrigins, byName, summaries) {
@@ -22861,7 +23299,7 @@ function callMayMutateCache(fn, call, cacheId, caches, functions, seen = /* @__P
 }
 function hasSharedLinearScan(functions, cacheId) {
   const cacheName = cacheId.startsWith("global:") ? cacheId.split(":").at(-1) : cacheId.split(".").at(-1);
-  const cache = escapeRegExp(cacheName);
+  const cache = escapeRegExp2(cacheName);
   return functions.some((fn) => new RegExp(`\\.(?:Lock|RLock)\\s*\\(\\)[\\s\\S]{0,500}?for\\s+[^\\n{]*range\\s+(?:[A-Za-z_]\\w*\\.)?${cache}\\b`).test(maskGoNonCode(fn.source)));
 }
 function parseOuterCall(expression) {
@@ -22915,10 +23353,10 @@ function union(...sets) {
 function sameDependencies(left, right) {
   return left.size === right.size && [...left].every((item) => right.has(item));
 }
-function escapeRegExp(value) {
+function escapeRegExp2(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
-function deduplicate(signals) {
+function deduplicate2(signals) {
   const seen = /* @__PURE__ */ new Set();
   return signals.filter((signal) => {
     const key = `${String(signal.data.cacheDeclaration)}:${String(signal.data.insertion)}`;
@@ -22927,11 +23365,11 @@ function deduplicate(signals) {
     return true;
   });
 }
-function importAliases(source, root, module2, defaultAlias) {
+function importAliases2(source, root, module2, defaultAlias) {
   const aliases = /* @__PURE__ */ new Set();
   for (const spec of descendants(root, "import_spec")) {
     const text = sourceText(spec, source).trim();
-    const match = text.match(new RegExp(`^(?:(\\.|[A-Za-z_]\\w*)\\s+)?"${escapeRegExp(module2)}"$`));
+    const match = text.match(new RegExp(`^(?:(\\.|[A-Za-z_]\\w*)\\s+)?"${escapeRegExp2(module2)}"$`));
     if (match !== null) aliases.add(match[1] ?? defaultAlias);
   }
   return aliases;
@@ -23026,7 +23464,7 @@ function maskGoNonCode(source, maskStrings = true) {
 }
 
 // src/string-concat.ts
-var RULE_ID2 = "go-perf.string-concat-loop";
+var RULE_ID3 = "go-perf.string-concat-loop";
 var SMALL_FIXED_BOUND = 32;
 function stringConcatLoopSignals(file, root) {
   const signals = [];
@@ -23047,7 +23485,7 @@ function stringConcatLoopSignals(file, root) {
     if (!declaration.isString && !expressionProvesString(right, file.current)) continue;
     if (hasPerIterationReset(loop, assignment, name2, file.current)) continue;
     signals.push({
-      ruleId: RULE_ID2,
+      ruleId: RULE_ID3,
       path: file.path,
       line: assignment.startPosition.row + 1,
       ...assignment.endPosition.row === assignment.startPosition.row ? {} : { endLine: assignment.endPosition.row + 1 },
@@ -23353,6 +23791,14 @@ async function analyzeDiscovery(discovery) {
   } catch (error) {
     parseErrors.push({
       path: "<cross-file request-keyed cache analysis>",
+      message: error instanceof Error ? error.message : String(error)
+    });
+  }
+  try {
+    signals.push(...await environmentProcessInspectionSignals(discovery.files));
+  } catch (error) {
+    parseErrors.push({
+      path: "<cross-file environment process inspection analysis>",
       message: error instanceof Error ? error.message : String(error)
     });
   }
@@ -23718,7 +24164,7 @@ function addPositives(ctx, analysis) {
 function createApp() {
   const app = new Adversary({
     name: domain.name,
-    version: "0.0.10",
+    version: "0.0.11",
     review: { maximumFindings: 8, minimumConfidence: "medium" }
   });
   app.rule(`${domain.name}.review`, async (ctx) => {
