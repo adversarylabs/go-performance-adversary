@@ -1,6 +1,6 @@
 # Go Performance adversary
 
-Reviews Go for resource amplification, defer-in-loop, per-request clients, hot-path regexp compilation, and quadratic string building.
+Reviews Go for resource amplification, defer-in-loop, per-request clients, hot-path regexp compilation, repeated process inspection, and quadratic string building.
 
 ## Goals
 

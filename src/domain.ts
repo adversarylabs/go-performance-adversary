@@ -100,6 +100,20 @@ export const domain: DomainDefinition = {
       recommendation:
         "Use a cache with a hard entry/weight limit and eviction, or constrain/admit request keys before doing the miss work.",
     },
+    {
+      id: "go-perf.environment-process-inspection-per-request",
+      title: "Environment-specific process inspection runs on every request",
+      category: "performance",
+      severity: "medium",
+      confidence: "high",
+      summary: (count) =>
+        `${count} request path${count === 1 ? "" : "s"} repeatedly inspect process metadata without applicability gating or a bounded cache.`,
+      whyItMatters:
+        "Process and container identity inspection can read procfs and parse cgroup state; doing that per RPC adds system calls and parsing even on nodes where the environment-specific identity cannot exist.",
+      impact: "Every configured request pays avoidable filesystem and parsing latency, multiplied by request rate.",
+      recommendation:
+        "Gate the resolver once when the target environment is absent and cache successful or empty process-ID lookups for a bounded interval.",
+    },
   ],
   noRiskSummary:
     "No material defer-in-loop, per-request client, repeated compilation, or quadratic string building was found.",
