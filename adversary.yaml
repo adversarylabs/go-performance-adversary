@@ -1,4 +1,4 @@
-name: go/performance
+name: adversarylabs/go/performance
 version: 0.0.11
 description: "Reviews Go for resource amplification, defer-in-loop, per-request clients, hot-path regexp compilation, and quadratic string building."
 
