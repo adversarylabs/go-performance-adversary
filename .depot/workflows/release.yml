@@ -103,7 +103,7 @@ jobs:
             exit 1
           fi
           # Signer only needs private seed + key-id; user CLIs verify with release public key.
-          GOBIN="${RUNNER_TEMP}/bin" go install github.com/adversarylabs/adversary.9.4
+          GOBIN="${RUNNER_TEMP}/bin" go install github.com/adversarylabs/adversary@2026.9.4
           export PATH="${RUNNER_TEMP}/bin:$PATH"
           printf '%s\n' "$ADVERSARY_SERVICE_ACCOUNT_TOKEN" | adversary login --token-stdin --profile sign --registry-namespace adversarylabs
           trap 'adversary --profile sign logout --local-only >/dev/null 2>&1 || true' EXIT
