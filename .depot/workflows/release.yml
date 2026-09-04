@@ -58,7 +58,7 @@ jobs:
       - name: Synchronize release metadata
         id: version
         # domain/name catalog id support
-        uses: adversarylabs/actions/version@f05769343546ba73c1a531e61119b47541d648f5 # v1.4.2
+        uses: adversarylabs/actions/version@e9aceca3e1edf2b261ec611a7caba15278135e9e # v1.4.3
         with:
           tag: ${{ github.ref_name }}
           path: .
@@ -69,7 +69,7 @@ jobs:
       - name: Push adversary
         id: push
         # domain/name remote refs
-        uses: adversarylabs/actions/push@f05769343546ba73c1a531e61119b47541d648f5 # v1.4.2
+        uses: adversarylabs/actions/push@e9aceca3e1edf2b261ec611a7caba15278135e9e # v1.4.3
         with:
           # 2026.8.3+ publishes README.md and CHECKS.md as catalog OCI referrers.
           cli-version: 2026.9.4
