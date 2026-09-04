@@ -58,7 +58,7 @@ jobs:
       - name: Synchronize release metadata
         id: version
         # domain/name catalog id support
-        uses: adversarylabs/actions/version@e28f2dd6e94bc7df79bdd53d8f0452e65031f0b1
+        uses: adversarylabs/actions/version@e9aceca3e1edf2b261ec611a7caba15278135e9e # v1.4.3
         with:
           tag: ${{ github.ref_name }}
           path: .
@@ -69,10 +69,10 @@ jobs:
       - name: Push adversary
         id: push
         # domain/name remote refs
-        uses: adversarylabs/actions/push@252098208fdbf919e3530d99d3f51314d3db0bd9 # v1.4.1
+        uses: adversarylabs/actions/push@e9aceca3e1edf2b261ec611a7caba15278135e9e # v1.4.3
         with:
           # 2026.8.3+ publishes README.md and CHECKS.md as catalog OCI referrers.
-          cli-version: 2026.9.4-beta.3
+          cli-version: 2026.9.4
           path: .
           token: ${{ secrets.ADVERSARY_SERVICE_ACCOUNT_TOKEN }}
           # CI is the publish authority — full catalog path, no adversarylabs/ prefix.
@@ -103,7 +103,7 @@ jobs:
             exit 1
           fi
           # Signer only needs private seed + key-id; user CLIs verify with release public key.
-          GOBIN="${RUNNER_TEMP}/bin" go install github.com/adversarylabs/adversary@2026.9.4-beta.3
+          GOBIN="${RUNNER_TEMP}/bin" go install github.com/adversarylabs/adversary@2026.9.4
           export PATH="${RUNNER_TEMP}/bin:$PATH"
           printf '%s\n' "$ADVERSARY_SERVICE_ACCOUNT_TOKEN" | adversary login --token-stdin --profile sign --registry-namespace adversarylabs
           trap 'adversary --profile sign logout --local-only >/dev/null 2>&1 || true' EXIT
