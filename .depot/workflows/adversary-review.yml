@@ -34,8 +34,8 @@ jobs:
           path: .
           data-dir: /mnt/adversary
           include-summary: false
-          model-provider: fireworks
-          model: ${{ vars.ADVERSARY_MODEL }}
-          model-api-key: ${{ secrets.FIREWORKS_API_KEY }}
+          model-provider: camel
+          model: auto
+          model-api-key: ${{ secrets.CAMEL_API_KEY }}
           auth-mode: oidc
           registry-namespace: adversarylabs
